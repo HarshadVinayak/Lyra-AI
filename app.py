@@ -1,0 +1,4441 @@
+import os
+import re
+import ast
+import requests
+import uuid
+import time
+import threading
+import concurrent.futures
+import json
+import base64
+import io
+from flask import Flask, request, jsonify, render_template_string, send_file, Response, stream_with_context
+from dotenv import load_dotenv
+from duckduckgo_search import DDGS
+import requests
+import concurrent.futures
+
+# Performance: Global Connection Pooling
+http_session = requests.Session()
+adapter = requests.adapters.HTTPAdapter(pool_connections=20, pool_maxsize=50)
+http_session.mount('https://', adapter)
+http_session.mount('http://', adapter)
+
+try: 
+    from PyPDF2 import PdfReader
+    from PIL import Image
+    import hashlib
+except ImportError: 
+    PdfReader = None
+    Image = None
+
+load_dotenv()
+
+app = Flask(__name__)
+app.config['MAX_CONTENT_LENGTH'] = 32 * 1024 * 1024 # 32MB Limit
+
+import math
+
+# --------------------------
+# SEMANTIC PERSISTENT MEMORY
+# --------------------------
+MEMORY_FILE = "lyra_memory.json"
+memory_lock = threading.Lock()
+
+def load_persistent_memory():
+    if os.path.exists(MEMORY_FILE):
+        try:
+            with open(MEMORY_FILE, 'r') as f: return json.load(f)
+        except: return {"user_context": "", "semantic_bank": []}
+    return {"user_context": "", "semantic_bank": []}
+
+def save_persistent_memory(data):
+    with memory_lock:
+        try:
+            with open(MEMORY_FILE, 'w') as f: json.dump(data, f)
+        except Exception as e: print(f"Memory Save Error: {e}")
+
+memory = load_persistent_memory()
+if "semantic_bank" not in memory: memory["semantic_bank"] = []
+if "document_store" not in memory: memory["document_store"] = []
+if "config" not in memory: memory["config"] = {"response_style": "standard", "personality": "helpful", "speed_priority": True}
+if "proposals" not in memory: memory["proposals"] = []
+# --------------------------
+# UNIFIED OS CORE STATE
+# --------------------------
+GLOBAL_OS_STATE = {
+    "active_budget": 50000.0, # Target default INR
+    "planned_expenses": 0.0,
+    "current_trip": {
+        "destination": None,
+        "distance_km": 0,
+        "travel_time_hrs": 0,
+        "total_estimated_cost": 0.0,
+        "itinerary": []
+    },
+    "market_sentiment": "Neutral",
+    "last_calculation": {
+        "expression": "",
+        "result": "0"
+    },
+    "active_parameters": {},
+    "last_sync": time.time()
+}
+
+def sync_system_state(updates):
+    global GLOBAL_OS_STATE
+    for key, value in updates.items():
+        if key in GLOBAL_OS_STATE:
+            if isinstance(value, dict) and isinstance(GLOBAL_OS_STATE[key], dict):
+                GLOBAL_OS_STATE[key].update(value)
+            else:
+                GLOBAL_OS_STATE[key] = value
+    GLOBAL_OS_STATE["last_sync"] = time.time()
+    return GLOBAL_OS_STATE
+
+query_cache = {}
+memory = load_persistent_memory()
+
+def analyze_self():
+    print("DEBUG [Evolution]: Starting self-analysis...")
+    feedback_pool = [m["text"] for m in memory["semantic_bank"][-20:]]
+    context = "\n".join(feedback_pool)
+    prompt = f"Analyze this conversation log and your current config: {memory['config']}.\nIdentify 3 specific ways to improve your performance or behavior based on user interaction patterns. Return ONLY a JSON list of objects: [{{\"action\": \"description\", \"value\": \"change\"}}]"
+    
+    try:
+        res = mistral_call(prompt, [], "Lyra Metacognition Engine")
+        # Clean JSON and parse
+        import re
+        match = re.search(r'\[.*\]', res, re.DOTALL)
+        if match:
+            new_proposals = json.loads(match.group(0))
+            memory["proposals"] = new_proposals[:3]
+            save_persistent_memory(memory)
+            return True
+    except Exception as e:
+        print(f"Evolution Error: {e}")
+    return False
+
+def apply_change(action, value):
+    # Safe backup
+    try:
+        import shutil
+        shutil.copy(MEMORY_FILE, MEMORY_FILE + ".bak")
+        
+        # Mapping logic
+        if action == "response_style": memory["config"]["response_style"] = value
+        elif action == "personality": memory["config"]["personality"] = value
+        elif action == "speed": memory["config"]["speed_priority"] = (value == "true")
+        
+        save_persistent_memory(memory)
+        return True
+    except: return False
+
+# --------------------------
+# VECTOR MATH & EMBEDDINGS
+# --------------------------
+def get_embedding(text):
+    api_key = os.getenv("GEMINI_API_KEY")
+    if not api_key: return None
+    url = f"https://generativelanguage.googleapis.com/v1/models/text-embedding-004:embedContent?key={api_key}"
+    try:
+        payload = {"model": "models/text-embedding-004", "content": {"parts": [{"text": text}]}}
+        resp = requests.post(url, json=payload, timeout=5)
+        return resp.json().get('embedding', {}).get('values')
+    except Exception as e:
+        print(f"Embedding Error: {e}")
+        return None
+
+def cosine_similarity(v1, v2):
+    if not v1 or not v2: return 0.0
+    dot = sum(a * b for a, b in zip(v1, v2))
+    mag1 = math.sqrt(sum(a * a for a in v1))
+    mag2 = math.sqrt(sum(b * b for b in v2))
+    if not mag1 or not mag2: return 0.0
+    return dot / (mag1 * mag2)
+
+def retrieve_relevant_context(query, bank_key="semantic_bank", limit=3, threshold=0.65):
+    q_emb = get_embedding(query)
+    if not q_emb or not memory.get(bank_key): return []
+    
+    scores = []
+    for entry in memory[bank_key]:
+        score = cosine_similarity(q_emb, entry.get("embedding"))
+        scores.append((score, entry.get("text")))
+    
+    scores.sort(key=lambda x: x[0], reverse=True)
+    top = [s[1] for s in scores if s[0] > threshold][:limit]
+    if top: print(f"DEBUG: RAG ({bank_key}) retrieved {len(top)} slices. Top Similarity: {scores[0][0]:.4f}")
+    return top
+
+def chunk_text(text, chunk_size=400):
+    words = text.split()
+    return [" ".join(words[i:i + chunk_size]) for i in range(0, len(words), chunk_size)]
+
+def ingest_file_rag(file_data, filename):
+    ext = filename.split('.')[-1].lower()
+    text_content = ""
+    
+    if ext in ['jpg', 'jpeg', 'png']:
+        print(f"DEBUG: Performing RAG Vision Ingestion on {filename}...")
+        text_content = analyze_image(file_data, filename)
+    else:
+        text_content = extract_text_from_file(file_data, filename)
+
+    if not text_content or len(text_content.strip()) < 5: return
+
+    chunks = chunk_text(text_content)
+    print(f"DEBUG: Chunking {filename} into {len(chunks)} fragments...")
+    
+    source_tag = "[DOCUMENT SOURCE]" if ext not in ['jpg', 'jpeg', 'png'] else "[IMAGE SOURCE]"
+    
+    with memory_lock:
+        for chunk in chunks:
+            emb = get_embedding(chunk)
+            if not emb: continue
+            memory["document_store"].append({"text": f"{source_tag} {filename}: {chunk}", "embedding": emb})
+            if len(memory["document_store"]) > 200: memory["document_store"].pop(0)
+    save_persistent_memory(memory)
+
+VISION_CACHE = {}
+VISION_JOBS = {}
+
+def optimize_image_data(file_data):
+    if not Image: return file_data
+    try:
+        img = Image.open(io.BytesIO(file_data))
+        # Ensure RGB (converts RGBA/CMYK/etc)
+        if img.mode in ("RGBA", "P"): img = img.convert("RGB")
+        img.thumbnail((512, 512))
+        out = io.BytesIO()
+        img.save(out, format="JPEG", optimize=True, quality=85)
+        return out.getvalue()
+    except: return file_data
+
+# --------------------------
+# HIGH-PRECISION MATH ENGINE
+# --------------------------
+CALC_VARS = {}
+
+def normalize_math_expr(expr):
+    """Auto-fixes common mathematical notation errors."""
+    import re
+    e = expr.strip()
+    # Fix 2(3) -> 2*(3)
+    e = re.sub(r'(\d)\s*\(', r'\1*(', e)
+    # Fix (3)2 -> (3)*2
+    e = re.sub(r'\)\s*(\d)', r')*\1', e)
+    # Fix 2x -> 2*x (if x is pi or e)
+    e = re.sub(r'(\d)\s*(pi|e|sin|cos|tan|sqrt)', r'\1*\2', e)
+    return e
+
+def generate_math_steps(expr, result):
+    """Creates a logical step-by-step breakdown for simple arithmetic."""
+    try:
+        # Detect operators
+        ops = []
+        if "(" in expr: ops.append("Solving parentheses first.")
+        if "**" in expr or "^" in expr: ops.append("Evaluating exponents/roots.")
+        if "*" in expr or "/" in expr: ops.append("Processing multiplication/division.")
+        if "+" in expr or "-" in expr: ops.append("Finalizing addition/subtraction.")
+        
+        steps = f"**Logic Path**:\n- " + "\n- ".join(ops)
+        return f"**Answer**: {result}\n\n{steps}\n\n`{expr} = {result}`"
+    except: return f"**Answer**: {result}"
+
+def scientific_eval(expr):
+    """Highly optimized and secure scientific evaluator."""
+    import math
+    global CALC_VARS
+    
+    # 1. Handle Variable Assignment (e.g., a = 5)
+    if "=" in expr and not ("==" in expr or ">=" in expr or "<=" in expr or "!=" in expr):
+        try:
+            parts = expr.split("=")
+            var_name = parts[0].strip()
+            var_val_expr = parts[1].strip()
+            # Safety check on var name
+            if not var_name.isidentifier(): return "Error: Invalid Var Name"
+            res = scientific_eval(var_val_expr)
+            CALC_VARS[var_name] = res
+            return f"{var_name} set to {res}"
+        except: return "Error: Assignment Failed"
+
+    # 2. Normalize and Map
+    e = normalize_math_expr(expr)
+    clean_expr = e.replace("^", "**").replace("sqrt", "math.sqrt").replace("sin", "math.sin").replace("cos", "math.cos").replace("tan", "math.tan")
+    
+    # 3. Environment Context
+    safe_dict = {
+        "math": math, "sqrt": math.sqrt, "sin": math.sin, "cos": math.cos, "tan": math.tan,
+        "pi": math.pi, "e": math.e, **CALC_VARS
+    }
+    
+    # Allowed character whitelist for security
+    if any(m in clean_expr for m in ["import", "os", "sys", "open", "eval", "exec", "getattr", "setattr"]): return None
+    
+    try:
+        res = eval(clean_expr, {"__builtins__": None}, safe_dict)
+        return res
+    except: return None
+
+def parse_spoken_math(text):
+    """High-precision regex parser for spoken mathematical queries."""
+    import re
+    t = text.lower()
+    mapping = [
+        (r'square root of\s*(\d+)', r'sqrt(\1)'),
+        (r'(\d+)\s+whole square', r'(\1)^2'),
+        (r'(\d+)\s+power\s+(\d+)', r'\1^\2'),
+        (r'(\d+)\s+raised to\s+(\d+)', r'\1^\2'),
+        (r'sine of\s*(\d+)', r'sin(\1)'),
+        (r'cosine of\s*(\d+)', r'cos(\1)'),
+        (r'plus', '+'), (r'minus', '-'), (r'into', '*'), (r'multiplied by', '*'), (r'divided by', '/'), (r'over', '/')
+    ]
+    for pattern, replacement in mapping:
+        t = re.sub(pattern, replacement, t)
+    return t.strip()
+
+def ai_math_solvent(query):
+    """Orchestrates between Instant Math Engine and AI Word Problem Solver."""
+    # 1. Attempt Instant Local Solve
+    res = scientific_eval(query)
+    if res is not None and not isinstance(res, str):
+        return generate_math_steps(query, res)
+    elif isinstance(res, str) and res.startswith("Error"):
+        return res
+        
+    # 2. Fallback to AI for Word Problems
+    sys = "You are the Logic Catalyst. Decompose word problems into pure math and solve. Format: [EXPR] ... [EXPL] ..."
+    raw = fast_orchestrator(query, [], sys)
+    
+    if "[EXPR]" in raw:
+        parts = raw.split("[EXPL]")
+        expr = parts[0].replace("[EXPR]", "").strip()
+        expl = parts[1].strip() if len(parts) > 1 else ""
+        res_val = scientific_eval(expr)
+        if res_val is not None:
+            return f"**Answer**: {res_val}\n\n**Neural Breakdown**:\n{expl}\n\n`{expr} = {res_val}`"
+    
+    return fast_orchestrator(query, [], "Expert solve.")
+
+# --------------------------
+# MULTI-AGENT SWARM (MAS)
+# --------------------------
+def planner_agent(goal):
+    prompt = f"Goal: {goal}\nBreak this into 3-5 distinct steps. Return as a numbered list. Example: 1. Search X | 2. Creative Y | 3. Logic Z"
+    res = groq_call(prompt, [], "🧠 Lead Planner Agent")
+    return [s.strip() for s in res.split('\n') if s.strip() and s[0].isdigit()][:5]
+
+def creative_agent(task):
+    prompt = f"Perform this imaginative task: {task}. Be expressive, visionary, and creative."
+    return fast_orchestrator(prompt, [], "🎨 Creative Specialist")
+
+def logic_agent(task):
+    prompt = f"Analyze this task with precision: {task}. Be concise, logical, and evidence-based."
+    return fast_orchestrator(prompt, [], "📊 Logic Specialist")
+
+def executor_agent(goal, results):
+    prompt = f"Goal: {goal}\nReview these cross-agent reports:\n{results}\nSynthesize into a premium, formatted final deliverable. Remove redundancies."
+    return fast_orchestrator(prompt, [], "⚙️ System Executor")
+
+def run_agent_swarm(goal):
+    print(f"DEBUG [Swarm]: Planning goal: {goal}")
+    steps = planner_agent(goal)
+    results_map = {}
+    
+    def process_swarm_step(step):
+        # SKILL-BASED ROUTING
+        if any(w in step.lower() for w in ["search", "find", "latest"]):
+            return f"**[SEARCH]**: {serp_search(step)[:300]}"
+        elif any(w in step.lower() for w in ["image", "draw", "art", "design", "write", "creative"]):
+            return f"**[CREATIVE]**: {creative_agent(step)}"
+        else:
+            return f"**[LOGIC]**: {logic_agent(step)}"
+
+    # PARALLEL EXECUTION
+    final_results = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as swarm:
+        futures = {swarm.submit(process_swarm_step, s): s for s in steps}
+        for future in concurrent.futures.as_completed(futures, timeout=12):
+            try:
+                task_text = futures[future]
+                res = future.result()
+                final_results.append(f"### {task_text}\n{res}\n")
+            except: continue
+            
+    swarm_report = "\n".join(final_results)
+    return executor_agent(goal, swarm_report)
+
+# --------------------------
+# REASONING & VISION SYNTHESIS
+# --------------------------
+def reason_about_image(structured_data, query, mode_prompt=""):
+    system = "You are an Elite Image Reasoning Engine. Use the provided structured image data to answer the user query logically and accurately. Reason step-by-step."
+    prompt = f"IMAGE DATA:\n{structured_data}\n\nUSER QUERY: {query}"
+    return fast_orchestrator(prompt, [], system)
+
+def analyze_image(file_data, filename, deep=True):
+    h = hashlib.md5(file_data).hexdigest()
+    if h in VISION_CACHE and not deep:
+        print(f"DEBUG [Vision]: Cache hit for {filename}")
+        return VISION_CACHE[h]
+
+    start = time.time()
+    api_key = os.getenv("GEMINI_API_KEY")
+    if not api_key: return "Error: API Key missing."
+
+    url = f"https://generativelanguage.googleapis.com/v1/models/gemini-2.0-flash-lite-preview-02-05:generateContent?key={api_key}"
+    
+    try:
+        proc_data = optimize_image_data(file_data)
+        b64 = base64.b64encode(proc_data).decode('utf-8')
+        
+        # STRUCTURED EXTRACTION PROMPT
+        prompt = """Analyze this image and provide a structured breakdown. Return only a mini-summary followed by specific labels.
+Format:
+SUMMARY: [One sentence overview]
+OBJECTS: [list]
+SCENE: [description]
+TEXT: [any visible text]
+ACTIONS: [interactions detected]"""
+
+        payload = {
+            "contents": [{
+                "parts": [
+                    {"text": prompt},
+                    {"inline_data": {"mime_type": "image/jpeg", "data": b64}}
+                ]
+            }]
+        }
+        
+        resp = http_session.post(url, json=payload, timeout=12)
+        resp.raise_for_status()
+        raw_analysis = resp.json()['candidates'][0]['content']['parts'][0]['text']
+        
+        VISION_CACHE[h] = raw_analysis
+        print(f"DEBUG [Vision]: Analysis complete in {time.time()-start:.2f}s")
+        return raw_analysis
+        
+    except Exception as e:
+        print(f"ERROR [Vision]: {e}")
+        return "Visual metadata extraction failed."
+
+def add_to_semantic_memory(text):
+    if len(text.strip()) < 15: return
+    emb = get_embedding(text)
+    if not emb: return
+    memory["semantic_bank"].append({"text": text, "embedding": emb})
+    if len(memory["semantic_bank"]) > 50: memory["semantic_bank"].pop(0)
+    save_persistent_memory(memory)
+
+SYSTEM_PROMPT = """You are Lyra, an intelligent AI creation suite assistant.
+
+Your personality
+* Clear and confident:
+* Slightly conversational, not robotic
+* Helpful and practical
+* Never overly verbose
+* Speak naturally like a smart assistant
+
+When speaking:
+* Keep responses structured
+* Use simple language when possible
+* Avoid unnecessary filler words"""
+
+# --------------------------
+# DAEMON PRE-WARMING SYSTEM 
+# --------------------------
+def preload_models():
+    print("DEBUG: Executing pre-warm routine for API endpoints...")
+    try:
+        keys = [os.getenv(k).strip() for k in ["GROQ_API_KEY", "GROQ_API_KEY_2"] if os.getenv(k)]
+        if keys: requests.post("https://api.groq.com/openai/v1/chat/completions", headers={"Authorization": f"Bearer {keys[0]}", "Content-Type": "application/json"}, json={"model":"llama-3.3-70b-versatile","messages":[{"role":"user", "content":"ping"}], "max_tokens": 1}, timeout=1.5)
+    except: pass
+    try:
+        api_key = os.getenv("MISTRAL_API_KEY")
+        if api_key: requests.post("https://api.mistral.ai/v1/chat/completions", headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}, json={"model":"mistral-large-latest","messages":[{"role":"user","content":"ping"}], "max_tokens": 1}, timeout=1.5)
+    except: pass
+    print("DEBUG: Pre-warming complete.")
+
+threading.Thread(target=preload_models, daemon=True).start()
+
+
+HTML_TEMPLATE = r"""
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Lyra AI - Speed Engine</title>
+    <link href="https://fonts.googleapis.com/css2?family=Courier+Prime:wght@400;700&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/dompurify/3.0.6/purify.min.js"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.8.0/styles/tokyo-night-dark.min.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.8.0/highlight.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    
+    <style>
+        :root { --bg-main: #09090b; --bg-sidebar: #131316; --bg-input: rgba(41, 37, 54, 0.75); --text-main: #ffffff; --text-muted: #a1a1aa; --accent-purple: #8b5cf6; --accent-light: #c084fc; }
+        body { background-color: var(--bg-main); color: var(--text-main); font-family: 'Inter', sans-serif; margin: 0; padding: 0; display: flex; height: 100vh; overflow: hidden; background: radial-gradient(circle at 50% -20%, #1e133e, #09090b 70%); transition: background 0.4s ease, color 0.4s ease; }
+        
+        body.light-theme { --bg-main: #f8fafc; --bg-sidebar: #f1f5f9; --bg-input: rgba(255, 255, 255, 0.9); --text-main: #0f172a; --text-muted: #64748b; background: #f8fafc; }
+        body.light-theme #top-bar { background: linear-gradient(180deg, rgba(248,250,252,0.95) 0%, rgba(248,250,252,0) 100%); }
+        body.light-theme .bot-message { color: #334155; border-color: #6366f1; }
+        body.light-theme .message h1, body.light-theme .message h2, body.light-theme .message h3, body.light-theme .message strong { color: #0f172a; }
+        body.light-theme .user-message { background: linear-gradient(135deg, #e0e7ff, #c7d2fe); border-color: rgba(99, 102, 241, 0.3); color: #1e1b4b; }
+        body.light-theme #input-wrapper { box-shadow: 0 10px 30px rgba(0,0,0,0.05), 0 0 20px rgba(139, 92, 246, 0.05) inset; border-color: rgba(0,0,0,0.1); }
+        body.light-theme #message-input { color: #1e1b4b; }
+        body.light-theme .chip { background: white; border-color: rgba(139, 92, 246, 0.3); color: #7c3aed; }
+        body.light-theme .chip:hover { background: #f3e8ff; color: #6d28d9; }
+        body.light-theme .style-btn { background: white; color: #64748b; border-color: rgba(0,0,0,0.1); }
+        body.light-theme .style-btn.active { background: #f3e8ff; color: #7c3aed; border-color: #7c3aed; }
+        body.light-theme #empty-state h1 { color: #6d28d9; }
+        body.light-theme .sidebar-icon { color: #94a3b8; }
+        body.light-theme .sidebar-icon:hover { color: #0f172a; }
+        body.light-theme .code-wrapper { background: #f1f5f9; border-color: rgba(0,0,0,0.1); }
+        body.light-theme .code-wrapper .code-header { background: #e2e8f0; color: #475569; border-color: rgba(0,0,0,0.05); }
+        body.light-theme .code-wrapper .copy-btn { color: #475569; }
+        body.light-theme .upgrade-badge { background: white; border-color: rgba(139, 92, 246, 0.3); }
+        body.light-theme .upgrade-badge span { color: #7c3aed; }
+        body.light-theme .settings-layout { background: #f8fafc; color: #0f172a; }
+        body.light-theme .settings-layout h2 { color: #0f172a; border-color: rgba(0,0,0,0.1); }
+        body.light-theme .setting-item { border-color: rgba(0,0,0,0.1); }
+        body.light-theme .setting-info h4 { color: #0f172a; }
+        body.light-theme .setting-info p { color: #64748b; }
+        body.light-theme .setting-item select, body.light-theme .setting-item input { background: white; color: #0f172a; border-color: rgba(0,0,0,0.2); }
+        body.light-theme .chat-hist-item:hover, body.light-theme .chat-hist-item.active { background: rgba(0,0,0,0.05); color: #0f172a; }
+        body.light-theme .chat-hist-item { color: #64748b; }
+        body.light-theme .logo-text-small { color: #0f172a !important; }
+        body.light-theme .global-copy-btn { color: #64748b; }
+        body.light-theme .global-copy-btn:hover { color: #0f172a; background: rgba(0,0,0,0.05); }
+        body.light-theme .follow-up-pill { background: white; border: 1px solid rgba(139,92,246,0.3); color: #7c3aed; }
+        body.light-theme .follow-up-pill:hover { background: #f3e8ff; }
+
+        #toast-container { position: fixed; top: 30px; right: 30px; z-index: 1000; display: flex; flex-direction: column; gap: 15px; pointer-events: none; }
+        .toast { background: rgba(40,40,50,0.9); backdrop-filter: blur(8px); border-left: 4px solid var(--accent-purple); color: white; padding: 12px 24px; border-radius: 8px; box-shadow: 0 4px 15px rgba(0,0,0,0.4); animation: slideInRight 0.3s cubic-bezier(0.4, 0, 0.2, 1); font-size: 0.9rem; display: flex; align-items: center; gap: 10px; }
+        @keyframes slideInRight { from { transform: translateX(120%); opacity: 0; } to { transform: translateX(0); opacity: 1; } }
+
+        #sidebar { width: 260px; background-color: var(--bg-sidebar); display: flex; flex-direction: column; align-items: flex-start; padding: 25px 20px; z-index: 10; border-right: 1px solid rgba(255, 255, 255, 0.05); box-shadow: 2px 0 15px rgba(0,0,0,0.5); flex-shrink: 0; transition: background 0.4s; }
+        .sidebar-icon { color: var(--text-muted); font-size: 1.3rem; cursor: pointer; transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1); }
+        .sidebar-icon:hover { color: var(--text-main); transform: scale(1.15) translateY(-2px); }
+        .history-title { font-size: 0.8rem; color: #8c85a1; margin-top: 25px; margin-bottom: 10px; font-weight: 600; text-transform: uppercase; letter-spacing: 1px; width: 100%; }
+        .chat-history-list { display: flex; flex-direction: column; gap: 5px; width: 100%; overflow-y: auto; flex: 1; }
+        .chat-hist-item { padding: 10px 12px; border-radius: 6px; cursor: pointer; color: #d1d5db; font-size: 0.95rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; display: flex; align-items: center; gap: 8px; transition: all 0.2s; position: relative; }
+        .chat-hist-item i { font-size: 0.8rem; color: var(--accent-purple); }
+        .chat-hist-item:hover, .chat-hist-item.active { background: rgba(255,255,255,0.05); color: #fff; }
+        .chat-actions { position: absolute; right: 8px; display: none; gap: 8px; background: inherit; padding-left: 10px; }
+        .chat-hist-item:hover .chat-actions { display: flex; }
+        .chat-action-icon { font-size: 0.75rem; color: #64748b; transition: 0.2s; }
+        .chat-action-icon:hover { color: #fff; }
+        .chat-action-icon.delete:hover { color: #ef4444; }
+        .archived-section { margin-top: 15px; border-top: 1px solid rgba(255,255,255,0.05); padding-top: 15px; width:100%; }
+        .archived-title { font-size: 0.7rem; color: #4b5563; margin-bottom: 5px; padding-left: 5px; font-weight: 700; text-transform: uppercase; }
+        
+        .stats-box { background: linear-gradient(135deg, rgba(139,92,246,0.1), rgba(168,85,247,0.05)); padding: 12px; border-radius: 8px; font-size: 0.85rem; font-weight: 500; text-align: center; color: #c084fc; width: 100%; margin-top: 15px; border: 1px solid rgba(139,92,246,0.2); box-sizing: border-box; }
+        
+        #main-content { flex: 1; display: flex; flex-direction: column; min-height: 0; position: relative; }
+        
+        #top-bar { display: flex; justify-content: space-between; align-items: center; padding: 25px 45px 15px 45px; background: linear-gradient(180deg, rgba(9,9,11,0.9) 0%, rgba(9,9,11,0) 100%); z-index: 5; flex-shrink: 0; }
+        
+        .model-selector-wrapper { background: linear-gradient(135deg, #c0a9fe, #a88bfa); border-radius: 25px; padding: 8px 15px 8px 20px; display: flex; align-items: center; position: relative; box-shadow: 0 4px 15px rgba(139, 92, 246, 0.2); transition: transform 0.3s ease; }
+        .model-selector-wrapper:hover { transform: translateY(-2px); }
+        #provider-select { background: transparent; border: none; color: #111; font-weight: 700; font-family: 'Courier Prime', monospace; font-size: 1.1rem; letter-spacing: 2px; outline: none; cursor: pointer; appearance: none; padding-right: 25px; }
+        .model-selector-wrapper i { color: #111; position: absolute; right: 15px; pointer-events: none; }
+        
+        .top-right-group { display: flex; align-items: center; gap: 30px; }
+        .upgrade-badge { background: rgba(24, 25, 32, 0.6); backdrop-filter: blur(8px); border: 1px solid rgba(99, 102, 241, 0.3); border-radius: 20px; padding: 8px 20px; display: flex; align-items: center; gap: 12px; cursor: pointer; transition: all 0.3s; }
+        .upgrade-badge:hover { transform: scale(1.03); box-shadow: 0 0 20px rgba(99, 102, 241, 0.2); }
+        .upgrade-badge span { color: #818cf8; font-weight: 600; font-size: 0.95rem; font-family: 'Courier Prime', monospace; }
+        .upgrade-badge img { width: 25px; height: 25px; border-radius: 50%; object-fit: cover; animation: pulseGlow 3s infinite alternate; }
+        
+        .top-right-icons { display: flex; gap: 25px; color: var(--text-muted); font-size: 1.2rem; }
+        .top-right-icons i { cursor: pointer; transition: all 0.3s; }
+        .top-right-icons i:hover { color: var(--text-main); transform: scale(1.2); }
+        
+        #chat-container { flex: 1; padding: 10px 10vw; overflow-y: auto; display: flex; flex-direction: column; gap: 24px; scroll-behavior: smooth; position: relative; }
+        
+        /* CORE CENTRAL UI ENHANCEMENTS */
+        #empty-state { display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100%; text-align: center; }
+        #empty-state h1 { font-size: 2.3rem; color: #fff; font-weight: 500; font-family: 'Inter', sans-serif; letter-spacing: -0.5px; margin-bottom: 35px; }
+        .hero-action-chips { display: flex; gap: 12px; justify-content: center; }
+        .hero-chip { background: rgba(255,255,255,0.03); border: 1px solid rgba(255,255,255,0.08); padding: 12px 24px; border-radius: 25px; color: #fff; font-size: 0.95rem; cursor: pointer; transition: 0.3s; display: flex; align-items: center; gap: 10px; }
+        .hero-chip:hover { background: rgba(139,92,246,0.1); border-color: rgba(139,92,246,0.5); transform: translateY(-2px); }
+        .hero-chip i { font-size: 1.1rem; color: var(--accent-purple); }
+
+        .style-controls { display: flex; gap: 0px; background: rgba(255,255,255,0.03); border-radius: 20px; padding: 4px; border: 1px solid rgba(255,255,255,0.05); width: fit-content; margin: 0 auto 20px auto; }
+        .style-btn { border: none; background: transparent; color: #64748b; padding: 8px 20px; border-radius: 16px; font-size: 0.85rem; font-weight: 600; cursor: pointer; transition: 0.3s; display: flex; align-items: center; gap: 8px; }
+        .style-btn.active { background: rgba(139,92,246,0.2); color: #fff; }
+        .style-btn i { font-size: 0.9rem; }
+
+        #input-wrapper { background: rgba(25,25,31,0.8); border-radius: 28px; padding: 18px 25px; border: 1px solid rgba(255,255,255,0.08); display: flex; flex-direction: column; gap: 10px; position: relative; max-width: 800px; margin: 0 auto; box-shadow: 0 10px 40px rgba(0,0,0,0.4); }
+        #message-input { background: transparent; border: none; color: #fff; font-size: 1.05rem; width: 100%; outline: none; padding: 5px 0; }
+        .input-tools { display: flex; justify-content: space-between; align-items: center; margin-top: 5px; }
+        .tool-icons { display: flex; gap: 20px; align-items: center; color: #94a3b8; }
+        .tool-icons i { cursor: pointer; transition: 0.2s; font-size: 1.1rem; }
+        .tool-icons i:hover { color: #fff; }
+        #send-btn { background: var(--accent-purple) !important; width: 32px; height: 32px; border-radius: 50%; display: flex; align-items: center; justify-content: center; color: #fff; font-size: 0.9rem; cursor: pointer; transition: 0.3s; border: none; }
+        #send-btn:hover { background: #7c3aed !important; transform: scale(1.1); }
+
+        .footer-banner { width: 100%; padding: 20px 45px; display: flex; justify-content: space-between; align-items: center; position: absolute; bottom: 0; left: 0; box-sizing: border-box; }
+        .logo-box { display: flex; align-items: center; gap: 10px; color: #fff; font-family: 'Courier Prime'; font-weight: 700; font-size: 1.5rem; letter-spacing: 2px; }
+        .logo-box i { color: var(--accent-purple); font-size: 1.1rem; }
+        .disclaimer { color: #4b5563; font-size: 0.75rem; text-align: center; flex: 1; margin: 0 40px; }
+        #avatar-chip { width: 42px; height: 42px; background: linear-gradient(135deg, #a855f7, #ec4899); border-radius: 50%; display: flex; align-items: center; justify-content: center; font-weight: 800; color: #fff; font-size: 0.9rem; box-shadow: 0 5px 15px rgba(236, 72, 153, 0.3); cursor: pointer; }
+        
+        #top-bar { padding: 30px 45px; display: flex; justify-content: space-between; align-items: center; }
+        .model-selector-wrapper { background: rgba(255,255,255,0.03); border: 1px solid rgba(255,255,255,0.08); border-radius: 12px; padding: 10px 18px; box-shadow: none; display: flex; align-items: center; }
+        #provider-select { font-family: 'Inter', sans-serif; letter-spacing: 0; font-size: 0.95rem; font-weight: 600; color: #e2e8f0; border: none; background: transparent; outline: none; appearance: none; padding-right: 20px; cursor: pointer; }
+        .model-selector-wrapper i { color: #64748b; font-size: 0.8rem; pointer-events: none; }
+        
+        .footer-banner { flex-shrink: 0; display: flex; justify-content: space-between; align-items: center; padding: 15px 30px; width: 100%; box-sizing: border-box; z-index: 1; }
+        .logo-text { color: transparent; -webkit-text-stroke: 1px rgba(168, 85, 247, 0.6); font-family: 'Courier Prime', monospace; font-size: 2.2rem; font-weight: 700; letter-spacing: 4px; display: flex; align-items: center; gap: 10px; transition: all 0.5s; }
+        .logo-text:hover { opacity: 1; -webkit-text-stroke: 1.5px rgba(168, 85, 247, 0.9); }
+        .logo-text i { color: #a855f7; font-size: 1.4rem; -webkit-text-stroke: 0px; animation: pulseGlow 2s infinite alternate; }
+        .disclaimer { color: #666; font-size: 0.75rem; letter-spacing: 0.5px; }
+        
+        #avatar-chip { background: linear-gradient(135deg, #a855f7, #f472b6); width: 55px; height: 55px; border-radius: 50%; display: flex; justify-content: center; align-items: center; font-weight: 800; font-size: 1.4rem; color: white; text-shadow: 1px 1px 2px rgba(0,0,0,0.3); box-shadow: 0 5px 20px rgba(236, 72, 153, 0.4); cursor: pointer; transition: all 0.4s; }
+        #avatar-chip:hover { transform: scale(1.1) rotate(5deg); }
+        
+        ::-webkit-scrollbar { width: 8px; }
+        ::-webkit-scrollbar-track { background: transparent; }
+        ::-webkit-scrollbar-thumb { background: rgba(139, 92, 246, 0.3); border-radius: 10px; }
+        ::-webkit-scrollbar-thumb:hover { background: rgba(139, 92, 246, 0.6); }
+
+        /* MODALS */
+        .modal-overlay { position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.6); backdrop-filter: blur(10px); z-index: 9999; display: flex; justify-content: center; align-items: center; opacity: 0; pointer-events: none; transition: all 0.4s; transform: scale(1.05); }
+        .modal-overlay.active { opacity: 1; pointer-events: auto; transform: scale(1); }
+        .modal-content { background: #171717; color: #fff; border-radius: 12px; padding: 40px; position: relative; box-shadow: 0 10px 40px rgba(0,0,0,0.5); max-width: 1100px; width: 90%; border: 1px solid rgba(255,255,255,0.05); }
+        .close-btn { position: absolute; top: 20px; right: 20px; background: transparent; border: none; color: #a1a1aa; font-size: 1.5rem; cursor: pointer; transition: color 0.3s; }
+        .close-btn:hover { color: white; }
+
+        .pricing-cards { display: grid; grid-template-columns: repeat(4, 1fr); gap: 20px; margin-top: 20px; }
+        .card { background: transparent; padding: 20px; border-right: 1px solid rgba(255,255,255,0.05); display: flex; flex-direction: column; position: relative; }
+        .pricing-cards .card:last-child { border-right: none; }
+        .card.highlight { background: #2b2b46; border-radius: 16px; border: 1px solid rgba(139, 92, 246, 0.4); margin: -15px 0; padding: 35px 20px; box-shadow: 0 0 30px rgba(99, 102, 241, 0.2); }
+        .card h3 { font-size: 1.8rem; font-weight: 500; margin: 0 0 15px 0; }
+        .card .badge { position: absolute; top: 15px; right: 15px; background: rgba(255,255,255,0.1); font-size: 0.6rem; padding: 4px 8px; border-radius: 12px; letter-spacing: 1px; }
+        .card .price { font-size: 2.8rem; font-weight: 600; display: flex; align-items: flex-start; gap: 5px; margin-bottom: 25px; }
+        .card .price span { font-size: 1.5rem; margin-top: 5px; }
+        .card .price sub { font-size: 0.75rem; color: #a1a1aa; font-weight: normal; margin-top: 20px; margin-left: 5px; }
+        .card .strikethrough { text-decoration: line-through; color: #a1a1aa; font-size: 2.8rem; font-weight: normal; margin: 0 10px; }
+        .card .btn { width: 100%; padding: 12px; border-radius: 20px; font-weight: 600; cursor: pointer; border: none; transition: all 0.2s; margin-bottom: 30px; font-family: inherit;}
+        .card .btn.outlined { background: transparent; border: 1px solid rgba(255,255,255,0.2); color: white; }
+        .card .btn.outlined:hover { background: rgba(255,255,255,0.1); }
+        .card .btn.solid { background: white; color: black; }
+        .card .btn.promo { background: #6366f1; color: white; }
+        .card .btn.promo:hover { background: #4f46e5; }
+        .card .features { list-style: none; padding: 0; margin: 0; font-size: 0.85rem; color: #e2e8f0; }
+        .card .features li { margin-bottom: 15px; display: flex; gap: 12px; align-items: flex-start; }
+        .card .features i { color: #a1a1aa; margin-top: 3px; font-size: 1rem; width: 20px; text-align: center; }
+
+        .settings-layout { max-width: 500px; background: var(--bg-sidebar); border: 1px solid rgba(139, 92, 246, 0.3); }
+        .settings-layout h2 { border-bottom: 1px solid rgba(255,255,255,0.05); padding-bottom: 20px; margin-top:0; color: var(--text-main);}
+        .setting-item { display: flex; justify-content: space-between; align-items: center; padding: 20px 0; border-bottom: 1px solid rgba(255,255,255,0.05); }
+        .setting-info h4 { margin: 0 0 5px 0; font-size: 1.05rem; color: var(--text-main); }
+        .setting-info p { margin: 0; color: var(--text-muted); font-size: 0.85rem; }
+        .setting-item select, .setting-item input { background: var(--bg-main); border: 1px solid rgba(255,255,255,0.1); color: var(--text-main); padding: 10px 15px; border-radius: 8px; font-family: inherit; font-size: 0.9rem;}
+        
+        .streaming-cursor { display: inline-block; width: 6px; height: 1.2em; background: var(--accent-purple); margin-left: 2px; vertical-align: middle; animation: cursor-blink 0.8s infinite; box-shadow: 0 0 10px var(--accent-purple); }
+        @keyframes cursor-blink { 0%, 100% { opacity: 1; } 50% { opacity: 0; } }
+
+        .message { max-width: 85%; padding: 18px 22px; border-radius: 20px; font-size: 1.05rem; line-height: 1.6; position: relative; font-family: 'Inter', sans-serif; transition: all 0.3s ease; }
+        .user-message { background: rgba(255,255,255,0.05); color: #fff; align-self: flex-end; border-bottom-right-radius: 4px; border: 1px solid rgba(255,255,255,0.08); }
+        .bot-message { background: transparent; color: #e2e8f0; align-self: flex-start; border-bottom-left-radius: 4px; padding-left: 0; }
+        
+        .thinking-state { display: flex; align-items: center; gap: 8px; color: #8b5cf6; font-weight: 600; font-size: 0.9rem; margin-bottom: 12px; animation: pulse-opacity 2s infinite ease-in-out; }
+        @keyframes pulse-opacity { 0%, 100% { opacity: 0.6; } 50% { opacity: 1; } }
+
+        .skeleton-box { 
+            background: linear-gradient(90deg, rgba(255,255,255,0.02) 25%, rgba(255,255,255,0.06) 50%, rgba(255,255,255,0.02) 75%);
+            background-size: 200% 100%;
+            animation: skeleton-shimmer 1.5s infinite linear;
+            border-radius: 12px;
+        }
+        @keyframes fadeIn { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
+        
+        .app-page { position: absolute; top: 35px; left: 0; width: 100%; height: calc(100% - 35px); display: none; flex-direction: column; opacity: 0; transition: all 0.25s cubic-bezier(0.4, 0, 0.2, 1); transform: translateY(5px); }
+        .app-page.active { display: flex; opacity: 1; transform: translateY(0); }
+        
+        button, .rail-icon, .action-pill, .place-card { transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1); }
+        button:active, .rail-icon:active { transform: scale(0.95); }
+        
+        .mode-badge { font-size: 0.7rem; font-weight: 800; text-transform: uppercase; letter-spacing: 1.5px; padding: 4px 10px; border-radius: 6px; background: rgba(139,92,246,0.15); color: var(--accent-purple); border: 1px solid rgba(139,92,246,0.3); margin-bottom: 15px; display: inline-block; }
+
+        .form-overlay { position: fixed; bottom: 100px; left: 50%; transform: translateX(-50%); width: 90%; max-width: 600px; background: #171717; border: 1px solid rgba(139, 92, 246, 0.4); border-radius: 20px; padding: 25px; box-shadow: 0 20px 50px rgba(0,0,0,0.8); z-index: 1000; opacity: 0; pointer-events: none; transition: all 0.3s ease; }
+        .form-overlay.active { opacity: 1; pointer-events: auto; bottom: 120px; }
+        .form-group { margin-bottom: 20px; }
+        .form-group label { display: block; margin-bottom: 8px; font-size: 0.9rem; color: #a1a1aa; font-weight: 500; }
+        .form-group input, .form-group select, .form-group textarea { width: 100%; background: #0c0c0e; border: 1px solid rgba(255,255,255,0.1); border-radius: 10px; padding: 12px; color: white; font-family: inherit; font-size: 0.95rem; box-sizing: border-box; }
+        .form-group textarea { height: 80px; resize: none; }
+        .form-actions { display: flex; justify-content: space-between; align-items: center; }
+        .form-btn { padding: 10px 25px; border-radius: 10px; cursor: pointer; font-weight: 600; border: none; transition: all 0.3s; }
+        .form-btn.cancel { background: transparent; color: #ef4444; }
+        .form-btn.submit { background: #8b5cf6; color: white; box-shadow: 0 4px 15px rgba(139, 92, 246, 0.4); }
+        .form-btn.submit:hover { background: #7c3aed; transform: scale(1.05); }
+
+        .iteration-row { display: flex; gap: 10px; margin-top: 15px; flex-wrap: wrap; }
+        .action-pill { background: rgba(255,255,255,0.05); border: 1px solid rgba(255,255,255,0.1); color: #e2e8f0; padding: 6px 14px; border-radius: 20px; font-size: 0.8rem; cursor: pointer; transition: 0.3s; display: flex; align-items: center; gap: 6px; }
+        .action-pill:hover { background: rgba(139, 92, 246, 0.2); border-color: #8b5cf6; color: white; }
+        .action-pill.export { border-color: rgba(74, 222, 128, 0.4); color: #4ade80; }
+        .action-pill.export:hover { background: rgba(74, 222, 128, 0.1); }
+        
+        .dictate-btn.active { color: #f87171 !important; text-shadow: 0 0 10px rgba(248, 113, 113, 0.6); animation: mic-pulse 1.5s infinite; }
+        @keyframes mic-pulse { 0% { transform: scale(1); } 50% { transform: scale(1.2); } 100% { transform: scale(1); } }
+
+        /* MULTIMODAL STYLE UI */
+        .img-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 15px; margin-top: 15px; }
+        .style-btn { background: rgba(255,255,255,0.05); color: #fff; padding: 8px 14px; border-radius: 8px; text-decoration: none; font-size: 0.85rem; transition: 0.3s; cursor: pointer; border: 1px solid rgba(255,255,255,0.1); display: flex; align-items: center; gap: 8px; font-family: 'Inter', sans-serif;}
+        .style-btn:hover { background: rgba(139, 92, 246, 0.2); border-color: #8b5cf6; transform: translateY(-2px); }
+        .style-btn.primary { background: rgba(139, 92, 246, 0.4); border-color: #8b5cf6; }
+
+        /* CHATGPT STYLE VOICE OVERLAY LOGIC */
+        .voice-overlay { position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: #000; z-index: 99999; display: flex; flex-direction: column; align-items: center; justify-content: center; opacity: 0; pointer-events: none; transition: opacity 0.4s; }
+        .voice-overlay.active { opacity: 1; pointer-events: auto; }
+        
+        .chatgpt-container { display: flex; flex-direction: column; align-items: center; justify-content: center; flex: 1; }
+        .chatgpt-orb { position: relative; width: 150px; height: 150px; display: flex; justify-content: center; align-items: center; transition: all 0.5s ease; }
+        
+        .orb-core { position: absolute; width: 80px; height: 80px; background: white; border-radius: 50%; z-index: 3; transition: all 0.3s; animation: orb-breathe 4s infinite ease-in-out; box-shadow: 0 0 40px rgba(255,255,255,0.8); }
+        .orb-glow { position: absolute; width: 160px; height: 160px; background: radial-gradient(circle, rgba(255,255,255,0.3) 0%, rgba(255,255,255,0) 70%); border-radius: 50%; z-index: 2; animation: orb-pulse 2.5s infinite alternate ease-in-out; }
+        
+        /* State 1: Listening */
+        @keyframes orb-breathe { 0%, 100% { transform: scale(1); } 50% { transform: scale(1.1); } }
+        @keyframes orb-pulse { 0% { transform: scale(0.9); opacity: 0.5; } 100% { transform: scale(1.1); opacity: 1; } }
+        
+        /* State 2: Thinking */
+        .chatgpt-orb.thinking .orb-core { width: 50px; height: 50px; background: #fff; box-shadow: 0 0 50px #fff; animation: orb-think 1s infinite cubic-bezier(0.4, 0, 0.2, 1); }
+        .chatgpt-orb.thinking .orb-glow { width: 100px; height: 100px; background: radial-gradient(circle, rgba(255,255,255,0.5) 0%, rgba(255,255,255,0) 70%); animation: none; }
+        @keyframes orb-think { 0% { transform: scale(0.8); border-radius: 40%; } 50% { transform: scale(1.2); border-radius: 50%; } 100% { transform: scale(0.8); border-radius: 40%; } }
+        
+        /* State 3: Speaking */
+        .chatgpt-orb.speaking .orb-core { width: 100px; height: 100px; background: #fff; box-shadow: 0 0 60px #fff; animation: orb-speak-core 0.3s infinite alternate ease-in-out; }
+        .chatgpt-orb.speaking .orb-glow { width: 220px; height: 220px; background: radial-gradient(circle, rgba(255,255,255,0.5) 0%, rgba(255,255,255,0) 70%); animation: orb-speak-glow 0.4s infinite alternate ease-in-out; }
+        @keyframes orb-speak-core { 0% { transform: scale(0.95); border-radius: 50%; } 100% { transform: scale(1.1); border-radius: 42%; } }
+        @keyframes orb-speak-glow { 0% { transform: scale(0.8); opacity: 0.6; } 100% { transform: scale(1.2); opacity: 0.9; } }
+        
+        .voice-status-text { margin-top: 60px; color: #a1a1aa; font-size: 1rem; letter-spacing: 1px; font-weight: 500; font-family: 'Inter', sans-serif; transition: opacity 0.3s; }
+        .voice-bottom-controls { padding-bottom: 60px; display: flex; gap: 20px; }
+        .voice-icon-btn { width: 65px; height: 65px; border-radius: 50%; border: none; display: flex; justify-content: center; align-items: center; font-size: 1.6rem; cursor: pointer; transition: all 0.3s; color: white; background: #3f3f46; }
+        .voice-icon-btn.end-call { background: #ef4444; }
+        .voice-icon-btn.end-call:hover { background: #dc2626; transform: scale(1.05); box-shadow: 0 0 20px rgba(239, 68, 68, 0.4); }
+        .voice-icon-btn.mic-btn { background: #fff; color: #000; }
+        .voice-icon-btn.mic-btn:hover { background: #f4f4f5; transform: scale(1.05); }
+
+        /* PLANNER MINI-APP STYLES (V2: TRAVEL & HUB) */
+        .planner-layout { display: grid; grid-template-columns: 240px 1fr 340px; height: calc(100vh - 120px); gap: 20px; padding: 20px 45px; }
+        .planner-sidebar, .planner-board, .planner-ai-panel { background: rgba(255,255,255,0.02); border: 1px solid rgba(255,255,255,0.05); border-radius: 24px; display: flex; flex-direction: column; overflow: hidden; }
+        .planner-sidebar { padding: 25px; overflow-y: auto; }
+        .planner-board { padding: 25px; overflow-y: auto; background: linear-gradient(180deg, rgba(255,255,255,0.02) 0%, rgba(139,92,246,0.02) 100%); }
+        .planner-ai-panel { padding: 25px; overflow-y: auto; }
+
+        .planner-nav-item { padding: 12px 18px; border-radius: 12px; font-size: 0.85rem; color: #64748b; cursor: pointer; transition: 0.3s; font-weight: 600; display: flex; align-items: center; gap: 12px; margin-bottom: 5px; }
+        .planner-nav-item:hover { background: rgba(255,255,255,0.03); color: #fff; }
+        .planner-nav-item.active { background: rgba(139,92,246,0.1); color: var(--accent-purple); border: 1px solid rgba(139,92,246,0.2); }
+
+        .discovery-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 18px; margin-top: 15px; }
+        .discovery-card { background: rgba(255,255,255,0.03); border: 1px solid rgba(255,255,255,0.05); border-radius: 18px; overflow: hidden; cursor: pointer; transition: 0.3s; }
+        .discovery-card:hover { transform: translateY(-5px); border-color: var(--accent-purple); background: rgba(255,255,255,0.06); }
+        .discovery-card-img { width: 100%; height: 120px; background: #1a1a1e; display: flex; align-items: center; justify-content: center; position: relative; }
+        .discovery-card-info { padding: 15px; }
+        .discovery-card-info .title { font-weight: 700; color: #fff; font-size: 0.9rem; margin-bottom: 4px; }
+        .discovery-card-info .meta { font-size: 0.75rem; color: #64748b; display: flex; justify-content: space-between; }
+        .discovery-card-info .price { color: #4ade80; font-weight: 700; }
+
+        .budget-tracker { background: rgba(0,0,0,0.2); border: 1px solid rgba(255,255,255,0.05); padding: 20px; border-radius: 18px; margin-top: auto; }
+        .budget-bar-bg { width: 100%; height: 8px; background: rgba(255,255,255,0.05); border-radius: 4px; margin: 12px 0; overflow: hidden; }
+        .budget-bar-fill { height: 100%; background: var(--accent-purple); box-shadow: 0 0 10px var(--accent-purple); transition: 0.5s; width: 0%; }
+        
+        /* SCHEDULE & TIMELINE */
+        .planner-timeline { display: flex; flex-direction: column; gap: 15px; }
+        .timeline-item { display: grid; grid-template-columns: 80px 1fr 40px; align-items: center; background: rgba(255,255,255,0.03); border: 1px solid rgba(255,255,255,0.05); padding: 18px 20px; border-radius: 18px; transition: 0.3s; }
+        .timeline-item:hover { background: rgba(255,255,255,0.05); border-color: var(--accent-purple); }
+        .timeline-item.done { opacity: 0.5; filter: grayscale(100%); }
+        .item-time { font-family: 'Courier Prime'; color: var(--accent-purple); font-size: 0.85rem; font-weight: 700; }
+        .item-task { color: #fff; font-size: 0.9rem; }
+        .status-check { width: 22px; height: 22px; border-radius: 7px; border: 2px solid rgba(255,255,255,0.2); cursor: pointer; display: flex; align-items: center; justify-content: center; transition: 0.3s; }
+        .status-check.checked { background: #4ade80; border-color: #4ade80; color: #000; }
+
+        /* TRAVEL ITINERARY */
+        .trip-itinerary-day { margin-bottom: 30px; }
+        .itinerary-step { display: grid; grid-template-columns: 80px 1fr; gap: 20px; margin-bottom: 15px; position: relative; }
+        .itinerary-step::before { content: ""; position: absolute; left: 39px; top: 25px; height: calc(100% + 15px); border-left: 2px dashed rgba(255,255,255,0.1); }
+        .itinerary-step:last-child::before { display: none; }
+        .itinerary-time { font-family: 'Courier Prime'; color: var(--accent-purple); font-weight: 700; font-size: 0.8rem; }
+        .itinerary-dot { position: absolute; left: 35px; top: 5px; width: 10px; height: 10px; background: #fff; border-radius: 50%; box-shadow: 0 0 10px #fff; z-index: 1; }
+        .itinerary-content { background: rgba(255,255,255,0.03); padding: 15px; border-radius: 12px; border: 1px solid rgba(255,255,255,0.05); }
+
+        .ai-panel-header { display: flex; align-items: center; gap: 10px; margin-bottom: 25px; font-weight: 700; color: var(--accent-purple); font-size: 0.85rem; letter-spacing: 1px; }
+        .ai-prompt-box textarea { width: 100%; height: 100px; background: rgba(0,0,0,0.2); border: 1px solid rgba(255,255,255,0.1); border-radius: 16px; padding: 15px; color: #fff; font-family: inherit; font-size: 0.9rem; outline: none; resize: none; margin-bottom: 15px; }
+        .ai-prompt-box button { width: 100%; padding: 14px; background: var(--accent-purple); border: none; color: white; border-radius: 12px; font-weight: 700; cursor: pointer; transition: 0.3s; }
+        .ai-suggestions { margin-top: 30px; display: flex; flex-direction: column; gap: 10px; }
+        .suggestion-card { background: rgba(139,92,246,0.05); padding: 15px; border-radius: 12px; border: 1px solid rgba(139,92,246,0.1); font-size: 0.8rem; color: #a1a1aa; line-height: 1.5; }
+
+        /* FINANCE MINI-APP STYLES */
+        .finance-layout { display: grid; grid-template-columns: 280px 1fr 340px; height: calc(100vh - 120px); gap: 20px; padding: 20px 45px; }
+        .finance-sidebar, .finance-board, .finance-ai-panel { background: rgba(255,255,255,0.02); border: 1px solid rgba(255,255,255,0.05); border-radius: 24px; padding: 25px; overflow-y: auto; display: flex; flex-direction: column; }
+        
+        .finance-watchlist { display: flex; flex-direction: column; gap: 10px; margin-top: 15px; }
+        .watch-item { background: rgba(255,255,255,0.03); border: 1px solid rgba(255,255,255,0.05); padding: 15px; border-radius: 16px; cursor: pointer; transition: 0.3s; display: flex; justify-content: space-between; align-items: center; }
+        .watch-item:hover { background: rgba(255,255,255,0.06); border-color: rgba(139,92,246,0.3); transform: scale(1.02); }
+        .symbol-box .symbol { font-weight: 700; font-size: 1rem; color: #fff; }
+        .symbol-box .name { font-size: 0.7rem; color: #64748b; text-transform: uppercase; }
+        .price-box { text-align: right; }
+        .price-box .price { font-weight: 700; color: #fff; }
+        .price-box .change { font-size: 0.8rem; font-weight: 600; }
+        .change.up { color: #4ade80; }
+        .change.down { color: #ef4444; }
+
+        .search-box { position: relative; width: 100%; }
+        .search-box input { width: 100%; background: #0c0c0e; border: 1px solid rgba(255,255,255,0.1); border-radius: 12px; padding: 12px 40px 12px 15px; color: #fff; font-family: inherit; font-size: 0.85rem; outline: none; box-sizing: border-box;}
+        .search-box i { position: absolute; right: 15px; top: 13px; color: #64748b; cursor: pointer; }
+
+        .disclaimer-chip { margin-top: auto; background: rgba(239,68,68,0.05); border: 1px solid rgba(239,68,68,0.1); padding: 12px; border-radius: 12px; color: #f87171; font-size: 0.7rem; display: flex; gap: 8px; align-items: flex-start; }
+
+        .time-filters { display: flex; gap: 8px; }
+        .filter { padding: 6px 12px; border-radius: 8px; font-size: 0.75rem; color: #64748b; cursor: pointer; background: rgba(0,0,0,0.2); }
+        .filter.active { background: var(--accent-purple); color: #fff; }
+
+        .market-stats-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 15px; margin-top: 25px; }
+
+        .finance-ai-content { flex: 1; border-radius: 16px; padding: 15px; color: #e2e8f0; font-size: 0.9rem; line-height: 1.6; }
+        .empty-ai-state { height: 100%; display: flex; align-items: center; justify-content: center; text-align: center; color: #64748b; opacity: 0.5; font-size: 0.85rem; }
+
+        .portfolio-sim { margin-top: 20px; background: rgba(255,255,255,0.03); padding: 20px; border-radius: 20px; border: 1px solid rgba(255,255,255,0.05); }
+        .portfolio-sim h3 { font-size: 0.9rem; margin-bottom: 15px; font-weight: 700; color: #fff; }
+        .sim-row { display: flex; justify-content: space-between; margin-bottom: 8px; font-size: 0.85rem; }
+
+        /* HOME SCREEN & LAUNCHER STYLES */
+        .home-layout { padding: 40px 60px; overflow-y: auto; height: 100%; display: flex; flex-direction: column; gap: 40px; }
+        .greeting-section h1 { font-size: 2.8rem; font-weight: 800; background: linear-gradient(135deg, #fff, #a1a1aa); -webkit-background-clip: text; -webkit-text-fill-color: transparent; margin-bottom: 10px; }
+        .greeting-section p { color: #64748b; font-size: 1.1rem; }
+
+        .launcher-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 25px; }
+        .app-card { background: rgba(255,255,255,0.03); border: 1px solid rgba(255,255,255,0.05); border-radius: 28px; padding: 30px; cursor: pointer; transition: all 0.4s cubic-bezier(0.4, 0, 0.2, 1); display: flex; flex-direction: column; gap: 15px; position: relative; overflow: hidden; }
+        .app-card:hover { transform: translateY(-8px); background: rgba(255,255,255,0.06); border-color: var(--accent-purple); box-shadow: 0 20px 40px rgba(0,0,0,0.4), 0 0 20px rgba(139,92,246,0.1); }
+        .app-card i { font-size: 2.2rem; color: var(--accent-purple); transition: 0.3s; }
+        .app-card:hover i { transform: scale(1.1) rotate(-5deg); color: var(--accent-light); }
+        .app-card h3 { font-size: 1.25rem; font-weight: 700; color: #fff; }
+        .app-card p { color: #8c85a1; font-size: 0.9rem; line-height: 1.5; }
+
+        .home-section-title { font-size: 0.85rem; font-weight: 700; text-transform: uppercase; letter-spacing: 2px; color: #475569; margin-bottom: 20px; display: flex; align-items: center; gap: 12px; }
+        .home-section-title::after { content: ""; flex: 1; height: 1px; background: rgba(255,255,255,0.05); }
+
+        .quick-actions { display: flex; gap: 15px; }
+        .action-chip { background: rgba(139,92,246,0.1); border: 1px solid rgba(139,92,246,0.2); padding: 12px 24px; border-radius: 100px; color: #c084fc; font-size: 0.9rem; font-weight: 600; cursor: pointer; transition: 0.3s; display: flex; align-items: center; gap: 10px; }
+        .action-chip:hover { background: var(--accent-purple); color: #fff; transform: scale(1.05); }
+
+        .activity-feed { display: grid; grid-template-columns: repeat(3, 1fr); gap: 20px; }
+        .activity-card { background: rgba(0,0,0,0.2); border: 1px solid rgba(255,255,255,0.03); padding: 20px; border-radius: 20px; display: flex; flex-direction: column; gap: 10px; }
+        .activity-card .meta { font-size: 0.7rem; color: #475569; font-weight: 700; }
+        .activity-card .content { color: #e2e8f0; font-size: 0.9rem; font-weight: 500; }
+        /* APP BAR & ROUTING */
+    #app-rail { width: 60px; background: rgba(0,0,0,0.3); border-right: 1px solid rgba(255,255,255,0.05); display: flex; flex-direction: column; align-items: center; padding: 20px 0; gap: 20px; z-index: 100; }
+    .rail-icon { width: 40px; height: 40px; border-radius: 12px; display: flex; align-items: center; justify-content: center; color: #64748b; cursor: pointer; transition: 0.3s; font-size: 1.2rem; }
+    .rail-icon:hover { background: rgba(255,255,255,0.05); color: #fff; }
+    .rail-icon.active { background: var(--accent-purple); color: #fff; box-shadow: 0 0 15px rgba(139,92,246,0.5); }
+    
+    #app-viewer { flex: 1; position: relative; overflow: hidden; display: flex; }
+    .os-status-bar { position: absolute; top: 0; left: 0; width: 100%; height: 35px; background: rgba(139,92,246,0.05); border-bottom: 1px solid rgba(139,92,246,0.1); display: flex; align-items: center; padding: 0 45px; gap: 30px; z-index: 1000; backdrop-filter: blur(10px); }
+    .status-node { font-family: 'Courier Prime', monospace; font-size: 0.65rem; color: #a1a1aa; display: flex; align-items: center; gap: 8px; font-weight: 700; letter-spacing: 0.5px; }
+    .status-node i { color: var(--accent-purple); font-size: 0.8rem; }
+    .status-node #os-node-status { color: #4ade80; }
+    .status-node #os-budget-val { color: #fff; }
+    .status-node #os-trip-val { color: #fff; }
+    .sync-pulse i { animation: pulse-sync 3s infinite; }
+    @keyframes pulse-sync { 0% { transform: rotate(0deg); opacity: 0.5; } 50% { transform: rotate(180deg); opacity: 1; } 100% { transform: rotate(360deg); opacity: 0.5; } }
+
+    .app-page { position: absolute; top: 35px; left: 0; width: 100%; height: calc(100% - 35px); display: none; flex-direction: column; opacity: 0; transition: opacity 0.3s ease; }
+    .app-page.active { display: flex; opacity: 1; }
+
+    /* SPECIALIZED APP STYLES */
+    .app-grid { display: grid; grid-template-columns: 1fr 350px; height: 100%; }
+    .app-main { padding: 30px; overflow-y: auto; }
+    .app-side { background: rgba(0,0,0,0.2); border-left: 1px solid rgba(255,255,255,0.05); padding: 20px; }
+    
+    .calc-keypad { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; margin-top: 20px; }
+    .calc-btn { background: rgba(255,255,255,0.05); border: 1px solid rgba(255,255,255,0.1); padding: 18px; border-radius: 12px; color: #fff; font-size: 1.1rem; cursor: pointer; transition: 0.2s; display: flex; align-items: center; justify-content: center; }
+    .calc-btn:hover { background: rgba(255,255,255,0.1); transform: scale(1.02); }
+    .calc-btn.op { color: var(--accent-purple); font-weight: bold; background: rgba(139,92,246,0.05); border-color: rgba(139,92,246,0.2); }
+    .calc-btn.sci { font-size: 0.9rem; color: #a1a1aa; font-style: italic; }
+    .calc-btn.sci:hover { color: var(--accent-light); border-color: var(--accent-purple); }
+    
+    .header-with-mic { display: flex; justify-content: space-between; align-items: center; }
+    .mic-btn-calc { background: rgba(139,92,246,0.1); border: 1px solid rgba(139,92,246,0.3); color: var(--accent-purple); width: 45px; height: 45px; border-radius: 50%; cursor: pointer; transition: 0.3s; display: flex; align-items: center; justify-content: center; font-size: 1.1rem; }
+    .mic-btn-calc:hover { background: var(--accent-purple); color: #fff; transform: scale(1.1); box-shadow: 0 0 15px rgba(139,92,246,0.4); }
+    .mic-btn-calc.active { background: #ef4444; border-color: #ef4444; color: #fff; animation: pulse-mic 1s infinite; }
+    @keyframes pulse-mic { 0% { box-shadow: 0 0 0 0 rgba(239, 68, 68, 0.7); } 70% { box-shadow: 0 0 0 10px rgba(239, 68, 68, 0); } 100% { box-shadow: 0 0 0 0 rgba(239, 68, 68, 0); } }
+
+        /* MAPS MINI-APP STYLES */
+        .maps-layout { display: grid; grid-template-columns: 320px 1fr 340px; height: calc(100vh - 120px); gap: 20px; padding: 20px 45px; }
+        .maps-sidebar, #map-canvas, .maps-ai-panel { background: rgba(255,255,255,0.02); border: 1px solid rgba(255,255,255,0.05); border-radius: 24px; overflow: hidden; display: flex; flex-direction: column; }
+        .maps-sidebar { padding: 25px; overflow-y: auto; }
+        .maps-ai-panel { padding: 25px; overflow-y: auto; }
+        
+        #map-canvas { background: #0c0c0e; z-index: 1; }
+        .leaflet-container { background: #0c0c0e !important; }
+        .leaflet-tile { filter: invert(100%) hue-rotate(180deg) brightness(85%) contrast(85%); }
+        .leaflet-bar a { background-color: #131316 !important; border-color: rgba(255,255,255,0.1) !important; color: #fff !important; }
+        
+        .map-search-group { display: flex; flex-direction: column; gap: 15px; margin-bottom: 25px; }
+        .map-search-input { width: 100%; background: #0c0c0e; border: 1px solid rgba(255,255,255,0.1); border-radius: 12px; padding: 12px 15px; color: #fff; font-family: inherit; font-size: 0.85rem; outline: none; }
+        .map-search-input:focus { border-color: var(--accent-purple); }
+        
+        .place-list { display: flex; flex-direction: column; gap: 10px; flex: 1; overflow-y: auto; }
+        .place-card { background: rgba(255,255,255,0.03); border: 1px solid rgba(255,255,255,0.05); padding: 15px; border-radius: 16px; cursor: pointer; transition: 0.3s; }
+        .place-card:hover { background: rgba(255,255,255,0.06); transform: scale(1.02); border-color: var(--accent-purple); }
+        .place-card .name { font-weight: 700; color: #fff; font-size: 0.9rem; margin-bottom: 4px; }
+        .place-card .address { font-size: 0.75rem; color: #64748b; }
+        
+        .route-controls { margin-top: 20px; padding: 15px; background: rgba(139,92,246,0.05); border: 1px solid rgba(139,92,246,0.1); border-radius: 16px; }
+        .route-btn { width: 100%; padding: 10px; background: var(--accent-purple); border: none; color: white; border-radius: 10px; font-weight: 600; cursor: pointer; margin-top: 10px; }
+        
+        .recom-grid { display: flex; flex-direction: column; gap: 12px; }
+        .recom-item { background: rgba(0,0,0,0.2); border: 1px solid rgba(255,255,255,0.05); padding: 15px; border-radius: 18px; }
+        .recom-item .rank { color: var(--accent-light); font-weight: 800; font-size: 0.7rem; text-transform: uppercase; margin-bottom: 5px; }
+
+        .location-btn { position: absolute; bottom: 20px; right: 20px; z-index: 1000; background: #fff; color: #000; border: none; width: 40px; height: 40px; border-radius: 50%; cursor: pointer; box-shadow: 0 4px 12px rgba(0,0,0,0.3); display: flex; align-items: center; justify-content: center; }
+
+        /* UTILITY HUB STYLES */
+    .utility-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 12px; margin-top: 15px; }
+    .utility-card { background: rgba(255,255,255,0.05); border: 1px solid rgba(255,255,255,0.1); padding: 15px; border-radius: 12px; text-align: center; cursor: pointer; transition: 0.3s; }
+    .utility-card:hover { transform: translateY(-5px); background: rgba(139,92,246,0.1); border-color: var(--accent-purple); }
+    .utility-card i { font-size: 1.5rem; margin-bottom: 10px; color: var(--accent-purple); display: block; }
+    .utility-card span { font-size: 0.85rem; font-weight: 600; }
+    .utility-card.active { border-color: #4ade80; background: rgba(74,222,128,0.05); }
+
+    .switch { position: relative; display: inline-block; width: 34px; height: 20px; }
+    .switch input { opacity: 0; width: 0; height: 0; }
+    .slider { position: absolute; cursor: pointer; top: 0; left: 0; right: 0; bottom: 0; background-color: #333; transition: .4s; border-radius: 34px; }
+    .slider:before { position: absolute; content: ""; height: 14px; width: 14px; left: 3px; bottom: 3px; background-color: white; transition: .4s; border-radius: 50%; }
+    input:checked + .slider { background-color: var(--accent-purple); }
+    input:checked + .slider:before { transform: translateX(14px); }
+</style>
+</head>
+<body>
+
+<div id="toast-container"></div>
+
+<!-- Utility Modal -->
+<div class="modal-overlay" id="utility-modal" onclick="if(event.target==this)closeModal('utility-modal')">
+    <div class="modal-content" style="max-width:500px;">
+        <button class="close-btn" onclick="closeModal('utility-modal')"><i class="fa-solid fa-xmark"></i></button>
+        <h2>Utility Hub 🛰️</h2>
+        <p style="color:#64748b; font-size:0.85rem; margin-bottom:20px;">Specialized tools for high-precision autonomous tasks.</p>
+        <div class="utility-grid">
+            <div class="utility-card" id="util-calc" onclick="setUtility('calculator')">
+                <i class="fa-solid fa-calculator"></i>
+                <span>Calculator</span>
+            </div>
+            <div class="utility-card" id="util-maps" onclick="setUtility('maps')">
+                <i class="fa-solid fa-location-dot"></i>
+                <span>Maps</span>
+            </div>
+            <div class="utility-card" id="util-finance" onclick="setUtility('finance')">
+                <i class="fa-solid fa-chart-line"></i>
+                <span>Finance</span>
+            </div>
+            <div class="utility-card" id="util-planner" onclick="setUtility('planner')">
+                <i class="fa-solid fa-calendar-check"></i>
+                <span>Planner</span>
+            </div>
+            <div class="utility-card" id="util-reset" onclick="setUtility('none')">
+                <i class="fa-solid fa-rotate-left" style="color:#ef4444;"></i>
+                <span>Reset Chat</span>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Settings Modal -->
+<div class="modal-overlay" id="settings-modal" onclick="if(event.target==this)closeModal('settings-modal')">
+    <div class="modal-content settings-layout">
+        <button class="close-btn" onclick="closeModal('settings-modal')"><i class="fa-solid fa-xmark"></i></button>
+        <h2>Lyra Settings</h2>
+        <div class="settings-group">
+            <div class="setting-item">
+                <div class="setting-info">
+                    <h4>Appearance Theme</h4>
+                    <p>Select your system interface colors.</p>
+                </div>
+                <select id="theme-selector" onchange="changeTheme(this.value)">
+                    <option value="dark">Dark Space</option>
+                    <option value="light">Light Aurora</option>
+                </select>
+            </div>
+            <div class="setting-item">
+                <div class="setting-info">
+                    <h4>AI Intelligence Mode</h4>
+                    <p>Select base behavioral model architecture.</p>
+                </div>
+                <select id="mode-selector" onchange="changeMode(this.value)">
+                    <option value="builder">Builder Mode 🧑‍💻</option>
+                    <option value="student">Student Mode 🎓</option>
+                    <option value="idea">Idea Mode 💡</option>
+                </select>
+            </div>
+            <div class="setting-item">
+                <div class="setting-info">
+                    <h4>Agent Swarm Mode 🧪</h4>
+                    <p>Enable multi-agent parallel execution (MAS).</p>
+                </div>
+                <label class="switch">
+                    <input type="checkbox" id="swarm-mode-toggle" checked onchange="toggleSwarmSettings(this.checked)">
+                    <span class="slider round"></span>
+                </label>
+            </div>
+            <div class="setting-item">
+                <select id="image-quality-select">
+                    <option value="standard" selected>Standard</option>
+                    <option value="hd">HD (High Detail)</option>
+                </select>
+            </div>
+            <div class="setting-item">
+                <div class="setting-info">
+                    <h4>AI Personality</h4>
+                    <p>Customize your profile initials.</p>
+                </div>
+                <input type="text" id="avatar-input" value="HV" maxlength="2" style="width: 50px; text-align: center; font-weight: bold;" onkeyup="updateAvatar(this.value)">
+            </div>
+            <div class="setting-item">
+                <div class="setting-info">
+                    <h4>Memory Profile</h4>
+                    <p>Context Lyra should always remember about you.</p>
+                </div>
+                <textarea id="memory-input" placeholder="e.g. My name is Harish, I build AI tools..." style="width:100%; height:60px; background:#0c0c0e; border:1px solid rgba(255,255,255,0.1); border-radius:8px; color:white; padding:8px; resize:none;"></textarea>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Pricing Lyra Plus Overlay -->
+<div class="modal-overlay" id="pricing-modal" onclick="if(event.target==this)closeModal('pricing-modal')">
+    <!-- Pricing code remains the same... -->
+    <div class="modal-content pricing-layout">
+        <button class="close-btn" onclick="closeModal('pricing-modal')"><i class="fa-solid fa-xmark"></i></button>
+        <div class="pricing-cards">
+            <!-- Free -->
+            <div class="card">
+                <h3>Free</h3>
+                <div class="price"><span>₹</span>0 <sub>INR / month</sub></div>
+                <button class="btn outlined" onclick="closeModal('pricing-modal'); showToast('Your current plan');">Your current plan</button>
+            </div>
+            <!-- Go -->
+            <div class="card">
+                <h3>Go</h3>
+                <div class="price"><span>₹</span>399 <sub>INR / month</sub></div>
+                <button class="btn solid" onclick="showToast('Go Setup Initializing...')">Upgrade to Go</button>
+            </div>
+            <!-- Plus -->
+            <div class="card highlight">
+                <div class="badge">LIMITED TIME</div>
+                <h3>Plus</h3>
+                <div class="price"><span>₹</span>1999 <span class="strikethrough">₹0</span> <sub>INR for first month</sub></div>
+                <button class="btn promo" onclick="showToast('Claiming Plus Offer...')">Claim free offer</button>
+            </div>
+            <!-- Pro -->
+            <div class="card">
+                <h3>Pro</h3>
+                <div class="price"><span>₹</span>10,699 <sub>INR / month</sub></div>
+                <button class="btn solid" onclick="showToast('Redirecting to Pro Dashboard...')">Upgrade to Pro</button>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- CHATGPT Voice Mode Overlay -->
+<div id="voice-overlay" class="voice-overlay">
+    <div class="chatgpt-container">
+        <div class="chatgpt-orb" id="chatgpt-orb">
+            <div class="orb-core"></div>
+            <div class="orb-glow"></div>
+        </div>
+        <div class="voice-status-text" id="voice-status-text">Listening...</div>
+    </div>
+    <div class="voice-bottom-controls">
+        <button class="voice-icon-btn mic-btn" title="Microphone Active"><i class="fa-solid fa-microphone"></i></button>
+        <button class="voice-icon-btn end-call" onclick="document.getElementById('voice-btn').click()" title="End Voice Chat"><i class="fa-solid fa-phone-slash"></i></button>
+    </div>
+</div>
+
+
+<div id="app-rail">
+    <div class="rail-icon active" onclick="switchApp('chat')" title="AI Chat Control">
+        <i class="fa-solid fa-message"></i>
+    </div>
+    <div class="rail-icon" onclick="switchApp('planner')" title="Planner & Schedule">
+        <i class="fa-solid fa-calendar-days"></i>
+    </div>
+    <div class="rail-icon" onclick="switchApp('finance')" title="Market Intelligence">
+        <i class="fa-solid fa-chart-line"></i>
+    </div>
+    <div class="rail-icon" onclick="switchApp('maps')" title="Maps & Geospatial">
+        <i class="fa-solid fa-map-location-dot"></i>
+    </div>
+    <div class="rail-icon" onclick="switchApp('calculator')" title="Precision Logic">
+        <i class="fa-solid fa-calculator"></i>
+    </div>
+    <div style="flex:1"></div>
+    <div class="rail-icon" onclick="openModal('settings-modal')" title="OS Settings">
+        <i class="fa-solid fa-gears"></i>
+    </div>
+</div>
+
+<div id="app-viewer">
+    <div id="os-status-bar" class="os-status-bar">
+        <div class="status-node"><i class="fa-solid fa-microchip"></i> LYRA CORE: <span id="os-node-status">ACTIVE</span></div>
+        <div class="status-node"><i class="fa-solid fa-wallet"></i> BUDGET: <span id="os-budget-val">₹0</span></div>
+        <div class="status-node"><i class="fa-solid fa-route"></i> TRIP: <span id="os-trip-val">NONE</span></div>
+        <div style="flex:1"></div>
+        <div class="status-node sync-pulse"><i class="fa-solid fa-rotate"></i> SYSTEM SYNC: <span id="os-last-sync">NOW</span></div>
+    </div>
+    <!-- CHAT APP -->
+    <div id="app-chat" class="app-page active" style="flex-direction:row;">
+        <div id="sidebar">
+            <div class="sidebar-header" style="display:flex; justify-content:space-between; width:100%; align-items:center; margin-bottom: 25px;">
+                <div class="logo-text-small" style="font-weight:700; font-family:'Courier Prime'; font-size:1.2rem; color:#fff;">LYRA AI</div>
+                <i class="fa-regular fa-pen-to-square sidebar-icon" style="margin:0;" onclick="startNewChat()"></i>
+            </div>
+            <button onclick="startNewChat()" style="width:100%; display:flex; align-items:center; gap:10px; background:rgba(139,92,246,0.1); border:1px solid rgba(139,92,246,0.3); border-radius:8px; padding:12px; color:#fff; cursor:pointer; font-family:inherit; margin-bottom: 10px; transition: all 0.3s;"><i class="fa-solid fa-plus"></i> New Chat</button>
+            <div class="history-title">Recent Activity</div>
+            <div id="chat-history-list" class="chat-history-list"></div>
+            <div id="archived-section" class="archived-section">
+                <div class="archived-title">Archived</div>
+                <div id="archived-list" class="chat-history-list"></div>
+            </div>
+            <div class="sidebar-spacer" style="flex:1;"></div>
+            <div class="stats-box" id="stats-box">🔥 Welcome back!</div>
+            <div class="sidebar-footer" style="display:flex; justify-content:space-between; width:100%; margin-top:15px; color:#a1a1aa; font-size:1.1rem;">
+                <i class="fa-solid fa-dna sidebar-icon" style="margin:0; color:var(--accent-purple);" onclick="openEvolution()" title="System Evolution"></i>
+                <i class="fa-solid fa-satellite sidebar-icon" style="margin:0;" onclick="openModal('utility-modal')" title="Utility Hub"></i>
+                <i class="fa-solid fa-gear sidebar-icon" style="margin:0;" onclick="openModal('settings-modal')" title="Settings"></i>
+            </div>
+        </div>
+
+        <div id="main-content">
+            <div id="top-bar">
+                <div class="model-selector-wrapper">
+                    <select id="provider-select">
+                        <option value="smart" selected>Smart Mode</option>
+                        <option value="orchestrator">Orchestrator AI</option>
+                        <option value="agent">Agent Mode</option>
+                        <option value="groq">Groq</option>
+                        <option value="openrouter">OpenRouter</option>
+                        <option value="gemini">Gemini</option>
+                    </select>
+                    <i class="fa-solid fa-chevron-down"></i>
+                </div>
+                <div class="top-right-group">
+                    <div class="upgrade-badge" onclick="openModal('pricing-modal')">
+                        <img src="/favicon.png" alt="Lyra Logo">
+                        <span>Upgrade to Lyra AI Plus</span>
+                    </div>
+                    <div class="top-right-icons">
+                        <i class="fa-solid fa-share-nodes" onclick="showToast('Share link copied!')"></i>
+                        <i class="fa-solid fa-trash" onclick="startNewChat()"></i>
+                        <i class="fa-solid fa-ellipsis-vertical" onclick="openModal('settings-modal')"></i>
+                    </div>
+                </div>
+            </div>
+
+            <div id="chat-container">
+                <div id="empty-state">
+                    <h1>What can I help you build today?</h1>
+                    <div class="hero-action-chips">
+                        <div class="hero-chip" onclick="loadChip('Build an app for my business')"><i class="fa-solid fa-code"></i> Build an app</div>
+                        <div class="hero-chip" onclick="loadChip('Explain how quantum computing works')"><i class="fa-solid fa-brain"></i> Explain AI</div>
+                        <div class="hero-chip" onclick="loadChip('Create a science fiction story about Mars')"><i class="fa-solid fa-book"></i> Create a story</div>
+                    </div>
+                </div>
+            </div>
+
+            <div id="bottom-section" style="position: relative; padding-bottom: 80px;">
+                <div class="style-controls">
+                    <button class="style-btn" onclick="changeMode('fast')"><i class="fa-solid fa-bolt"></i> Fast</button>
+                    <button class="style-btn active" onclick="changeMode('smart')"><i class="fa-solid fa-brain"></i> Smart</button>
+                    <button class="style-btn" onclick="changeMode('creative')"><i class="fa-solid fa-palette"></i> Creative</button>
+                </div>
+
+                <div id="input-wrapper">
+                    <div id="attachment-preview" style="display:none; padding:10px; background:rgba(255,255,255,0.05); border-radius:10px; margin-bottom:10px; font-size:0.85rem; color:#4ade80;"></div>
+                    <input type="text" id="message-input" placeholder="Message Lyra AI..." autocomplete="off">
+                    <div class="input-tools">
+                        <div class="tool-icons">
+                            <input type="file" id="file-uploader" style="display:none" onchange="handleFileUpload(this)">
+                            <i class="fa-solid fa-paperclip" onclick="document.getElementById('file-uploader').click()" title="Attach File"></i>
+                            <i id="voice-btn" class="fa-solid fa-comment-dots" title="Voice AI Overlay"></i>
+                            <i id="dictate-btn" class="fa-solid fa-microphone" title="Dictation (STT to Input)"></i>
+                            <i class="fa-solid fa-globe" onclick="toggleWebSearch()" title="Web Search"></i>
+                        </div>
+                        <button id="send-btn" onclick="sendMessage()"><i class="fa-solid fa-arrow-up"></i></button>
+                    </div>
+                </div>
+            </div>
+            
+            <div class="footer-banner">
+                <div class="logo-box">LYRA AI <i class="fa-solid fa-wand-magic-sparkles"></i></div>
+                <div class="disclaimer">Lyra AI can make mistakes. Verify critical information.</div>
+                <div id="avatar-chip" onclick="openModal('settings-modal')">HV</div>
+            </div>
+        </div>
+    </div>
+
+    <!-- STANDALONE CALCULATOR APP -->
+    <div id="app-calculator" class="app-page">
+        <div class="app-grid">
+            <div class="app-main">
+                <div class="header-with-mic">
+                    <h2>Hybrid Scientific Calculator 🧮</h2>
+                    <button class="mic-btn-calc" onclick="startCalcVoice()" id="calc-mic">
+                        <i class="fa-solid fa-microphone"></i>
+                    </button>
+                </div>
+                <div id="calc-display" style="background:rgba(0,0,0,0.3); padding:30px; border-radius:20px; font-size:2.5rem; text-align:right; margin:15px 0; border:1px solid rgba(255,255,255,0.05); font-family:'Courier Prime'; min-height:80px; display:flex; flex-direction:column; justify-content:center;">
+                    <div id="calc-expression" style="font-size:1rem; color:#64748b; margin-bottom:5px;"></div>
+                    <div id="calc-value">0</div>
+                </div>
+                <div class="calc-keypad scientific">
+                    <!-- Row 1: Sci Functions -->
+                    <button class="calc-btn sci" onclick="calcInput('sin(')">sin</button>
+                    <button class="calc-btn sci" onclick="calcInput('cos(')">cos</button>
+                    <button class="calc-btn sci" onclick="calcInput('tan(')">tan</button>
+                    <button class="calc-btn sci" onclick="calcInput('sqrt(')">√</button>
+                    
+                    <!-- Row 2: Sci Functions -->
+                    <button class="calc-btn sci" onclick="calcInput('pi')">π</button>
+                    <button class="calc-btn sci" onclick="calcInput('^')">xʸ</button>
+                    <button class="calc-btn sci" onclick="calcInput('(')">(</button>
+                    <button class="calc-btn sci" onclick="calcInput(')')">)</button>
+
+                    <!-- Standard Keys -->
+                    <button class="calc-btn" onclick="calcInput('7')">7</button>
+                    <button class="calc-btn" onclick="calcInput('8')">8</button>
+                    <button class="calc-btn" onclick="calcInput('9')">9</button>
+                    <button class="calc-btn op" onclick="calcInput('/')">÷</button>
+                    <button class="calc-btn" onclick="calcInput('4')">4</button>
+                    <button class="calc-btn" onclick="calcInput('5')">5</button>
+                    <button class="calc-btn" onclick="calcInput('6')">6</button>
+                    <button class="calc-btn op" onclick="calcInput('*')">×</button>
+                    <button class="calc-btn" onclick="calcInput('1')">1</button>
+                    <button class="calc-btn" onclick="calcInput('2')">2</button>
+                    <button class="calc-btn" onclick="calcInput('3')">3</button>
+                    <button class="calc-btn op" onclick="calcInput('-')">-</button>
+                    <button class="calc-btn" style="color:#ef4444;" onclick="calcClear()">AC</button>
+                    <button class="calc-btn" onclick="calcInput('0')">0</button>
+                    <button class="calc-btn" onclick="calcInput('.')">.</button>
+                    <button class="calc-btn op" style="background:var(--accent-purple);" onclick="calcExecute()">=</button>
+                    <button class="calc-btn op" onclick="calcInput('+')">+</button>
+                </div>
+            </div>
+            <div class="app-side" style="display:flex; flex-direction:column; gap:20px;">
+                <div class="graph-section" id="calc-graph-box" style="display:none; background:rgba(0,0,0,0.4); border:1px solid rgba(255,255,255,0.1); border-radius:18px; padding:15px; position:relative;">
+                    <h4 style="font-size:0.75rem; color:var(--accent-light); margin-bottom:10px;"><i class="fa-solid fa-chart-line"></i> FUNCTION PLOTTER</h4>
+                    <canvas id="calc-graph-canvas" width="240" height="180" style="width:100%; height:135px; background:#000; border-radius:8px;"></canvas>
+                    <button onclick="toggleGraph(false)" style="position:absolute; top:10px; right:10px; background:transparent; border:none; color:#64748b; cursor:pointer;"><i class="fa-solid fa-xmark"></i></button>
+                </div>
+
+                <div class="variable-monitor" id="calc-vars-box" style="background:rgba(255,255,255,0.02); border:1px solid rgba(255,255,255,0.05); border-radius:20px; padding:20px;">
+                    <h3 style="font-size:0.8rem; letter-spacing:1px; color:#64748b; margin-bottom:15px;">ENVIRONMENT VARS</h3>
+                    <div id="calc-variables" style="display:flex; flex-wrap:wrap; gap:8px;">
+                        <span style="color:#475569; font-size:0.75rem;">No variables defined.</span>
+                    </div>
+                </div>
+
+                <div class="computation-log" style="flex:1; background:rgba(255,255,255,0.02); border:1px solid rgba(255,255,255,0.05); border-radius:20px; padding:20px; overflow-y:auto;">
+                    <h3 style="font-size:0.8rem; letter-spacing:1px; color:#64748b; margin-bottom:15px;">LOG HISTORY</h3>
+                    <div id="calc-history" style="color:#64748b; font-size:0.85rem; line-height:1.6;">AI-powered math history will appear here.</div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- STANDALONE FINANCE APP -->
+    <div id="app-finance" class="app-page">
+        <div class="finance-layout">
+            <div class="finance-sidebar">
+                <div class="sidebar-section">
+                    <h3>Market Watchlist</h3>
+                    <div id="finance-watchlist" class="finance-watchlist">
+                        <!-- Stocks populate here -->
+                    </div>
+                </div>
+                <div class="sidebar-section" style="margin-top:30px;">
+                    <div class="search-box">
+                        <input type="text" id="stock-search-input" placeholder="Search Symbol (e.g. TCS)...">
+                        <i class="fa-solid fa-magnifying-glass" onclick="searchStock()"></i>
+                    </div>
+                </div>
+                <div class="disclaimer-chip">
+                    <i class="fa-solid fa-triangle-exclamation"></i>
+                    <span>Not Financial Advice. Use for educational simulation only.</span>
+                </div>
+            </div>
+
+            <div class="finance-board">
+                <div class="board-header">
+                    <div id="active-stock-info">
+                        <h2 id="active-symbol">MARKET OVERVIEW</h2>
+                        <div id="active-price-row" style="font-size:1.5rem; font-weight:700; margin-top:5px;">Awaiting Selection</div>
+                    </div>
+                    <div class="time-filters">
+                        <span class="filter active">7D</span>
+                        <span class="filter">1M</span>
+                        <span class="filter">1Y</span>
+                    </div>
+                </div>
+                <div class="chart-container" style="height: 350px; position:relative;">
+                    <canvas id="financeChart"></canvas>
+                </div>
+                <div class="market-stats-grid">
+                    <div class="utility-card"><span>MARKET CAP</span><div id="stat-cap">$3.1T</div></div>
+                    <div class="utility-card"><span>VOLATILITY</span><div id="stat-vol" style="color:#ef4444;">HIGH</div></div>
+                    <div class="utility-card"><span>SENTIMENT</span><div id="stat-sent" style="color:#4ade80;">BULLISH</div></div>
+                </div>
+            </div>
+
+            <div class="finance-ai-panel">
+                <div class="ai-panel-header">
+                    <i class="fa-solid fa-robot"></i>
+                    <span>LYRA MARKET ANALYST</span>
+                </div>
+                <div id="finance-ai-output" class="finance-ai-content">
+                    <div class="empty-ai-state">Select a stock to initiate deep cognitive analysis.</div>
+                </div>
+                <div class="portfolio-sim">
+                    <h3>Portfolio Simulation</h3>
+                    <div class="sim-row">
+                        <span>Invested</span>
+                        <span id="port-invested">$100,000</span>
+                    </div>
+                    <div class="sim-row">
+                        <span>Current Value</span>
+                        <span id="port-value" style="color:#4ade80;">$104,250</span>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- STANDALONE MAPS APP -->
+    <div id="app-maps" class="app-page">
+        <div class="maps-layout">
+            <div class="maps-sidebar">
+                <div class="map-search-group">
+                    <h3 style="font-size:0.8rem; color:#64748b; text-transform:uppercase; letter-spacing:1px; margin:0;">Regional Intel</h3>
+                    <div style="position:relative;">
+                        <input type="text" id="map-search-input" class="map-search-input" placeholder="Search a city or place..." onkeyup="if(event.key==='Enter')searchPlaces()">
+                        <i class="fa-solid fa-search" style="position:absolute; right:12px; top:13px; color:#64748b; cursor:pointer;" onclick="searchPlaces()"></i>
+                    </div>
+                </div>
+                
+                <div class="place-list" id="place-results">
+                    <!-- Results populate here -->
+                    <div style="text-align:center; padding:40px; color:#475569;">
+                        <i class="fa-solid fa-satellite-dish" style="font-size:2rem; margin-bottom:15px; display:block;"></i>
+                        Awaiting Location Query
+                    </div>
+                </div>
+
+                <div class="route-controls">
+                    <h4 style="font-size:0.8rem; color:#fff; margin-bottom:10px;"><i class="fa-solid fa-route"></i> Route Planner</h4>
+                    <input type="text" id="route-to" class="map-search-input" style="background:rgba(0,0,0,0.4);" placeholder="Enter destination...">
+                    <button class="route-btn" onclick="calculateRoute()">Generate Path</button>
+                    <div id="route-info" style="margin-top:10px; font-size:0.75rem; color:#a1a1aa;"></div>
+                </div>
+            </div>
+
+            <div style="position:relative; flex:1;">
+                <div id="map-canvas" style="height:100%;"></div>
+                <button class="location-btn" onclick="centerOnUser()" title="My Location">
+                    <i class="fa-solid fa-location-crosshairs"></i>
+                </button>
+            </div>
+
+            <div class="maps-ai-panel">
+                <div class="ai-panel-header">
+                    <i class="fa-solid fa-brain-circuit"></i>
+                    <span>GEOSPATIAL AI</span>
+                </div>
+                <div id="maps-ai-recommendations" class="recom-grid">
+                    <div class="empty-ai-state">
+                        Search for a place to unlock AI-based neighborhood intelligence.
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- STANDALONE PLANNER APP (V2: TRAVEL & HUB) -->
+    <div id="app-planner" class="app-page">
+        <div class="planner-layout">
+            <div class="planner-sidebar">
+                <div class="sidebar-section">
+                    <h3>PLANNER HUB</h3>
+                    <div class="planner-nav-item active" onclick="switchPlannerMode('SCHEDULE')"><i class="fa-solid fa-calendar-day"></i> Schedule</div>
+                    <div class="planner-nav-item" onclick="switchPlannerMode('TRAVEL')"><i class="fa-solid fa-plane"></i> Travel Plan</div>
+                    <div class="planner-nav-item" onclick="switchPlannerMode('DISCOVERY')"><i class="fa-solid fa-hotel"></i> Discovery</div>
+                </div>
+                
+                <div class="sidebar-section" style="margin-top:25px;">
+                    <h3>TEMPLATES</h3>
+                    <button class="template-btn" onclick="applyTripTemplate('weekend')"><i class="fa-solid fa-bag-shopping"></i> Weekend Trip</button>
+                    <button class="template-btn" onclick="applyTripTemplate('solo')"><i class="fa-solid fa-person-hiking"></i> Solo Adventure</button>
+                </div>
+
+                <div class="budget-tracker">
+                    <h4 style="font-size:0.75rem; color:#fff; margin:0;">ACTIVE BUDGET</h4>
+                    <div class="budget-bar-bg"><div id="budget-fill" class="budget-bar-fill" style="width: 45%;"></div></div>
+                    <div style="display:flex; justify-content:space-between; font-size:0.7rem; color:#64748b;">
+                        <span>Spent: ₹2,250</span>
+                        <span>Rem: ₹2,750</span>
+                    </div>
+                </div>
+            </div>
+
+            <div class="planner-board">
+                <div class="board-header">
+                    <h2 id="planner-board-title">Daily Orchestration 📅</h2>
+                    <div style="display:flex; gap:10px;">
+                        <button class="add-task-btn" onclick="openModal('add-task-modal')" title="Add Entry"><i class="fa-solid fa-plus"></i></button>
+                    </div>
+                </div>
+                
+                <div id="planner-main-view">
+                    <!-- Dynamic Rendering: Timeline vs Grid -->
+                    <div id="planner-timeline" class="planner-timeline">
+                        <div class="timeline-empty">System awaiting plan ingestion...</div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="planner-ai-panel">
+                <div class="ai-panel-header">
+                    <i class="fa-solid fa-earth-americas"></i>
+                    <span>TRAVEL INTELLIGENCE</span>
+                </div>
+                <div class="ai-prompt-box">
+                    <textarea id="planner-goal-input" placeholder="Where are we venturing? (e.g. 'Plan a 3-day budget trip to Mumbai for 2 people')"></textarea>
+                    <button onclick="generateTripPlan()"><i class="fa-solid fa-wand-magic-sparkles"></i> Architect Plan</button>
+                </div>
+                <div class="ai-suggestions" id="planner-suggestions">
+                    <div class="suggestion-card"><i class="fa-solid fa-lightbulb"></i> Lyra-Tip: Book flights 3 weeks in advance for 15% saving.</div>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<script>
+    // ---------------------------------
+    // LYRA NEURAL OS CORE STATE
+    // ---------------------------------
+    const lyraOS = {
+        state: {
+            active_budget: 0,
+            planned_expenses: 0,
+            current_trip: null,
+            market_sentiment: "Neutral"
+        },
+        async sync() {
+            try {
+                const resp = await fetch('/system/state');
+                this.state = await resp.json();
+                this.broadcast();
+            } catch(e) { console.warn("OS Sync Failure", e); }
+        },
+        async update(updates) {
+            try {
+                const resp = await fetch('/system/sync', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify(updates)
+                });
+                this.state = await resp.json();
+                this.broadcast();
+            } catch(e) { console.error("OS Update Failure", e); }
+        },
+        broadcast() {
+            // Signal all modules to refresh - Universal Sync
+            if (typeof renderPlanner === 'function') renderPlanner();
+            if (typeof renderFinance === 'function') renderFinance();
+            if (typeof renderCalculator === 'function') renderCalculator();
+            if (typeof updateHomeDashboard === 'function') updateHomeDashboard();
+            this.updateGlobalUI();
+        },
+        updateGlobalUI() {
+            const budgetFill = document.getElementById('budget-fill');
+            const budgetVal = document.getElementById('os-budget-val');
+            const tripVal = document.getElementById('os-trip-val');
+            const syncTime = document.getElementById('os-last-sync');
+
+            if (budgetFill) {
+                const percent = Math.min(100, (this.state.planned_expenses / this.state.active_budget) * 100);
+                budgetFill.style.width = `${percent}%`;
+                budgetFill.style.background = percent > 90 ? '#ef4444' : 'var(--accent-purple)';
+            }
+            if (budgetVal) {
+                const remaining = this.state.active_budget - this.state.planned_expenses;
+                budgetVal.innerText = LyraLogic.format(remaining);
+            }
+            if (tripVal) {
+                const trip = this.state.current_trip;
+                tripVal.innerText = trip && trip.destination ? `${trip.destination.toUpperCase()} (${trip.distance_km}km)` : 'IDLE';
+            }
+            if (syncTime) syncTime.innerText = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+        }
+    };
+
+    // SHARED CALCULATION ENGINE
+    const LyraLogic = {
+        calculateTravelCost(distance, mode = 'car') {
+            const rates = { 'car': 12, 'flight': 8, 'train': 3 };
+            return Math.round(distance * (rates[mode] || 12));
+        },
+        getBudgetSafe(intendedSpend) {
+            const remaining = lyraOS.state.active_budget - lyraOS.state.planned_expenses;
+            return { safe: intendedSpend <= remaining, balance: remaining - intendedSpend };
+        },
+        format(val) {
+            return new Intl.NumberFormat('en-IN', { style: 'currency', currency: 'INR', maximumFractionDigits: 0 }).format(val);
+        }
+    };
+
+    var currentStyle = 'smart'; 
+    var currentUtility = 'none';
+    var userStats = JSON.parse(localStorage.getItem('lyraStats')) || { msgCount: 0, streak: 1, lastDate: new Date().toDateString() };
+
+    const chatContainer = document.getElementById('chat-container');
+    const messageInput = document.getElementById('message-input');
+    const sendBtn = document.getElementById('send-btn');
+    const providerSelect = document.getElementById('provider-select');
+    const emptyState = document.getElementById('empty-state');
+    const voiceBtn = document.getElementById('voice-btn');
+    const dictateBtn = document.getElementById('dictate-btn');
+    const inputWrapper = document.getElementById('input-wrapper');
+    
+    // ---------------------------------
+    // HTML5 WEB SPEECH API INTEGRATION
+    // ---------------------------------
+    const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+    let recognition = null;
+    let isVoiceMode = false;
+    let silenceTimer = null;
+    let currentTranscript = "";
+    
+    // PREMIUM FEMALE VOICE CACHING
+    let lyraVoice = null;
+
+    function getBestFemaleVoice() {
+        const voices = window.speechSynthesis.getVoices();
+        if (voices.length === 0) return null;
+        
+        const preferred = voices.find(v => 
+            v.name.toLowerCase().includes("samantha") || 
+            v.name.toLowerCase().includes("zira") || 
+            v.name.toLowerCase().includes("aria") || 
+            v.name.toLowerCase().includes("eva") || 
+            v.name.toLowerCase().includes("google uk english female") || 
+            v.name.toLowerCase().includes("female")
+        );
+        
+        lyraVoice = preferred || voices.find(v => v.lang.startsWith('en')) || voices[0];
+        return lyraVoice;
+    }
+
+    if (window.speechSynthesis) {
+        window.speechSynthesis.onvoiceschanged = () => { getBestFemaleVoice(); };
+    }
+
+    if (SpeechRecognition) {
+        recognition = new SpeechRecognition();
+        recognition.continuous = true;
+        recognition.interimResults = true;
+        
+        recognition.onresult = (event) => {
+            let interim = "";
+            let final = "";
+            for (let i = event.resultIndex; i < event.results.length; ++i) {
+                if (event.results[i].isFinal) final += event.results[i][0].transcript;
+                else interim += event.results[i][0].transcript;
+            }
+            
+            currentTranscript += final;
+            let displayTxt = currentTranscript + interim;
+            
+            // EXTREME TTS INTERRUPTION MECHANISM
+            if (displayTxt.trim().length > 0 && window.speechSynthesis.speaking) {
+                window.speechSynthesis.cancel();
+                recognition.stop();
+                setTimeout(() => { if(isVoiceMode) recognition.start(); }, 50);
+                console.log("TTS Loop Shut Down via User Collision!");
+            }
+            
+            messageInput.value = displayTxt;
+            document.getElementById('chatgpt-orb').className = 'chatgpt-orb'; // Reset to listening state
+            
+            // Visual Backchanneling 
+            const bk = ["Hmm...", "Got it...", "Okay...", "I'm listening..."];
+            document.getElementById('voice-status-text').innerText = (displayTxt.length > 8 && Math.random() > 0.8) ? bk[Math.floor(Math.random()*bk.length)] : "Listening...";
+            
+            if (displayTxt.trim() !== '') document.getElementById('voice-transcript').innerText = displayTxt; // Full interim transcript
+            
+            // FAST TURN TAKING LOGIC (1s Silence Detector)
+            clearTimeout(silenceTimer);
+            silenceTimer = setTimeout(() => {
+                if (currentTranscript.trim() !== "") {
+                    currentTranscript = "";
+                    document.getElementById('chatgpt-orb').className = 'chatgpt-orb thinking';
+                    document.getElementById('voice-status-text').innerText = "Thinking...";
+                    sendMessage(); 
+                }
+            }, 1000);
+        };
+
+        recognition.onerror = (e) => {
+            console.error("Speech reco error", e);
+            if(isVoiceMode) setTimeout(() => recognition.start(), 1000); 
+        };
+
+        recognition.onend = () => {
+            if (isVoiceMode) recognition.start(); // Continuous Loop assertion
+        };
+    }
+
+    if (voiceBtn) {
+        voiceBtn.onclick = () => {
+            if (!SpeechRecognition) return showToast("Your browser fundamentally does not support the Web Speech API.");
+            isVoiceMode = !isVoiceMode;
+            if (isVoiceMode) {
+                voiceBtn.classList.add('active');
+                voiceBtn.innerHTML = '<i class="fa-solid fa-comment-dots fa-fade" style="color:var(--accent-purple)"></i>';
+                inputWrapper.classList.add('voice-active');
+                document.getElementById('voice-overlay').classList.add('active');
+                document.getElementById('chatgpt-orb').className = 'chatgpt-orb';
+                document.getElementById('voice-status-text').innerText = "Listening...";
+                showToast("Voice Intelligence Listening Array Activated.");
+                recognition.start();
+            } else {
+                voiceBtn.classList.remove('active');
+                voiceBtn.innerHTML = '<i class="fa-solid fa-comment-dots"></i>';
+                inputWrapper.classList.remove('voice-active');
+                document.getElementById('voice-overlay').classList.remove('active');
+                showToast("Voice Mode Offline.");
+                recognition.stop();
+                window.speechSynthesis.cancel();
+                clearTimeout(silenceTimer);
+                currentTranscript = "";
+            }
+        };
+    }
+
+    function playTTS(markdownText) {
+        if (!isVoiceMode) return;
+        
+        document.getElementById('chatgpt-orb').className = 'chatgpt-orb speaking';
+        document.getElementById('voice-status-text').innerText = "Speaking...";
+        
+        let cleanText = markdownText.replace(/#+\\s/g, "")
+                                    .replace(/(\\*\\*|__)(.*?)\\1/g, "$2")
+                                    .replace(/(\\*|_)(.*?)\\1/g, "$2")
+                                    .replace(/\\[(.*?)\\]\\(.*?\\)/g, "$1")
+                                    .replace(/`{1,3}[^`]*`{1,3}/g, "")
+                                    .replace(/---/g, "");
+                                    
+        // SENTENCE-LEVEL CHUNKING (Advanced TTS Parsing)
+        let sentences = cleanText.match(/[^.!?]+[.!?]+/g) || [cleanText];
+        
+        sentences.forEach((sentence, index) => {
+            if(sentence.trim().length === 0) return;
+            const utterance = new SpeechSynthesisUtterance(sentence.trim());
+            
+            // PRIORITY FEMALE VOICE INJECTION
+            if (lyraVoice) utterance.voice = lyraVoice;
+            else if (getBestFemaleVoice()) utterance.voice = lyraVoice;
+            
+            utterance.rate = 1.05;
+            utterance.pitch = 1.1;
+            
+            // Micro Delay Tuning implicitly applied over Queue System
+            if (index === sentences.length - 1) {
+                utterance.onend = () => {
+                    if(isVoiceMode) {
+                        document.getElementById('chatgpt-orb').className = 'chatgpt-orb';
+                        document.getElementById('voice-status-text').innerText = "Listening...";
+                        document.getElementById('voice-transcript').innerText = "Speak now...";
+                    }
+                };
+            }
+            window.speechSynthesis.speak(utterance);
+        });
+        
+        let lipSyncInterval = setInterval(() => {
+            if(!window.speechSynthesis.speaking) clearInterval(lipSyncInterval);
+        }, 300);
+    }
+    
+    // ---------------------------------
+    // STT DICTATION MODE (ChatGPT Style)
+    // ---------------------------------
+    let dictateRecognition = null;
+    let isDictating = false;
+    let baseTextBeforeSpeech = "";
+
+    if (SpeechRecognition) {
+        dictateRecognition = new SpeechRecognition();
+        dictateRecognition.continuous = true;
+        dictateRecognition.interimResults = true;
+        dictateRecognition.lang = "en-US";
+
+        dictateRecognition.onstart = () => {
+            isDictating = true;
+            dictateBtn.classList.add('active');
+            dictateBtn.classList.replace('fa-microphone', 'fa-microphone-slash');
+            baseTextBeforeSpeech = messageInput.value;
+            if (baseTextBeforeSpeech.length > 0 && !baseTextBeforeSpeech.endsWith(" ")) baseTextBeforeSpeech += " ";
+            showToast("Dictation Mode Active.");
+        };
+
+        dictateRecognition.onresult = (event) => {
+            let transcript = "";
+            for (let i = event.resultIndex; i < event.results.length; i++) {
+                transcript += event.results[i][0].transcript;
+            }
+            messageInput.value = baseTextBeforeSpeech + transcript;
+        };
+
+        dictateRecognition.onend = () => {
+            isDictating = false;
+            dictateBtn.classList.remove('active');
+            dictateBtn.classList.replace('fa-microphone-slash', 'fa-microphone');
+        };
+
+        dictateRecognition.onerror = () => {
+            dictateRecognition.stop();
+        };
+
+        if (dictateBtn) {
+            dictateBtn.onclick = () => {
+                if (isVoiceMode) return showToast("Close Voice Mode first.");
+                if (!isDictating) dictateRecognition.start();
+                else dictateRecognition.stop();
+            };
+        }
+    } else {
+        if (dictateBtn) dictateBtn.style.display = 'none';
+    }
+
+    // ---------------------------------
+    // CREATOR HUB & WORKFLOW LOGIC
+    // ---------------------------------
+    const workflowOverlay = document.getElementById('workflow-overlay');
+    const workflowFormContent = document.getElementById('workflow-form-content');
+    const workflowSubmitBtn = document.getElementById('workflow-submit-btn');
+    let activeWorkflow = null;
+
+    async function openEvolution() {
+        document.getElementById('evolution-overlay').classList.add('active');
+        const resp = await fetch('/evolution/proposals');
+        const data = await resp.json();
+        renderProposals(data.proposals);
+    }
+
+    function closeEvolution() {
+        document.getElementById('evolution-overlay').classList.remove('active');
+    }
+
+    async function runSelfAnalysis() {
+        showToast("Lyra is analyzing self-behavior...");
+        const resp = await fetch('/evolution/analyze', { method: 'POST' });
+        const data = await resp.json();
+        renderProposals(data.proposals);
+    }
+
+    function renderProposals(proposals) {
+        const list = document.getElementById('proposal-list');
+        list.innerHTML = proposals.length ? "" : "<p style='color:#64748b;'>No optimization protocols detected.</p>";
+        proposals.forEach((p, idx) => {
+            const div = document.createElement('div');
+            div.style = "background: rgba(255,255,255,0.05); padding:15px; border-radius:10px; margin-bottom:10px; border-left:4px solid var(--accent-purple);";
+            div.innerHTML = `
+                <div style="font-weight:bold; color:var(--accent-purple); font-size:0.85rem;">${p.action.toUpperCase()}</div>
+                <div style="font-size:0.8rem; margin:8px 0; color:#e2e8f0;">${p.description || 'System optimization suggested.'}</div>
+                <div style="font-size:0.75rem; color:#64748b;">Value: <code style="color:#10b981;">${p.value}</code></div>
+                <button class="action-pill" style="margin-top:10px; background:var(--accent-purple);" onclick="approveEvolution('${p.action}', '${p.value}', ${idx})">Approve Change</button>
+            `;
+            list.appendChild(div);
+        });
+    }
+
+    async function approveEvolution(action, value, idx) {
+        showToast("Adapting internal circuits...");
+        const resp = await fetch('/evolution/approve', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({ action, value, index: idx })
+        });
+        const data = await resp.json();
+        if (data.status === "success") {
+            showToast("System adaptation finalized.");
+            openEvolution();
+        }
+    }
+
+    function openWorkflow(type) {
+        activeWorkflow = type;
+        workflowOverlay.classList.add('active');
+        
+        let html = '';
+        if (type === 'idea') {
+            html = `
+                <h3 style="margin-top:0;"><i class="fa-solid fa-lightbulb"></i> Idea Generator</h3>
+                <div class="form-group"><label>Concept/Problem</label><input type="text" id="wf-topic" placeholder="e.g. Sustainable water bottles"></div>
+                <div class="form-group"><label>Target Audience</label><input type="text" id="wf-audience" placeholder="e.g. Gen-Z Hikers"></div>
+                <div class="form-group"><label>Output Focus</label><select id="wf-focus"><option value="Product">Product Idea</option><option value="Startup">Startup Model</option><option value="Marketing">Marketing Angle</option></select></div>
+            `;
+        } else if (type === 'content') {
+            html = `
+                <h3 style="margin-top:0;"><i class="fa-solid fa-pen-nib"></i> Content Creator</h3>
+                <div class="form-group"><label>Topic</label><input type="text" id="wf-topic" placeholder="e.g. The Future of AI"></div>
+                <div class="form-group"><label>Tone</label><select id="wf-tone"><option value="Professional">Professional</option><option value="Casual">Casual</option><option value="Witty">Witty</option><option value="Inspirational">Inspirational</option></select></div>
+                <div class="form-group"><label>Channel</label><select id="wf-channel"><option value="Blog">Blog Article</option><option value="LinkedIn">LinkedIn Post</option><option value="Email">Newsletter</option><option value="Script">YouTube Script</option></select></div>
+            `;
+        } else if (type === 'image') {
+            html = `
+                <h3 style="margin-top:0;"><i class="fa-solid fa-palette"></i> Image Creator</h3>
+                <div class="form-group"><label>Subject</label><input type="text" id="wf-topic" placeholder="e.g. A cat drinking tea"></div>
+                <div class="form-group"><label>Style</label><select id="wf-style"><option value="Realistic">Realistic</option><option value="Cyberpunk">Cyberpunk</option><option value="Anime">Anime</option><option value="Sketch">Sketch</option><option value="Oil Painting">Oil Painting</option></select></div>
+                <div class="form-group"><label>Lighting</label><select id="wf-lighting"><option value="Cinematic">Cinematic</option><option value="Natural">Natural</option><option value="Neon">Neon</option><option value="Dramatic High Contrast">Dramatic</option></select></div>
+            `;
+        } else if (type === 'builder') {
+            html = `
+                <h3 style="margin-top:0;"><i class="fa-solid fa-code"></i> Builder Hub</h3>
+                <div class="form-group"><label>I want to...</label><input type="text" id="wf-topic" placeholder="e.g. Create a Python scraper"></div>
+                <div class="form-group"><label>Language/Stack</label><input type="text" id="wf-stack" placeholder="e.g. Python, Flask, VSCode"></div>
+                <div class="form-group"><label>Task Type</label><select id="wf-task"><option value="Implementation">Build Feature</option><option value="Fix">Debug Code</option><option value="Refactor">Optimize</option><option value="Architecture">Design System</option></select></div>
+            `;
+        }
+        workflowFormContent.innerHTML = html;
+        
+        workflowSubmitBtn.onclick = () => {
+            let prompt = `[WORKFLOW: ${type.toUpperCase()}] `;
+            const inputs = workflowFormContent.querySelectorAll('input, select');
+            inputs.forEach(i => {
+                const label = i.previousElementSibling.innerText;
+                prompt += `${label}: ${i.value} | `;
+            });
+            closeWorkflow();
+            messageInput.value = prompt;
+            sendMessage();
+        };
+    }
+
+    function closeWorkflow() {
+        workflowOverlay.classList.remove('active');
+        activeWorkflow = null;
+    }
+
+    function iterate(action, originalContent) {
+        let msg = `[ITERATE: ${action}] based on the previous response.`;
+        messageInput.value = msg;
+        sendMessage();
+    }
+
+    function copyToClipboard(text) {
+        navigator.clipboard.writeText(text).then(() => showToast("Copied to clipboard!"));
+    }
+
+    function downloadText(text, name = "lyra-content.txt") {
+        const blob = new Blob([text], {type: "text/plain"});
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = name;
+        a.click();
+    }
+
+    let allChats = [];
+    let sessionId = localStorage.getItem('lyra_current_chat_id') || null;
+
+    async function initChatSystem() {
+        try {
+            const resp = await fetch('/chats');
+            allChats = await resp.json();
+            if (sessionId && !allChats.find(c => c.id === sessionId)) {
+                sessionId = null;
+            }
+            renderSidebar();
+            if (sessionId) loadChatHistory(sessionId);
+        } catch (e) {
+            console.error("Chat System Failure", e);
+            allChats = JSON.parse(localStorage.getItem('lyraChats') || '[]');
+            renderSidebar();
+        }
+    }
+
+    async function saveChatToServer(chat) {
+        await fetch('/chats/update', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify(chat)
+        });
+        localStorage.setItem('lyraChats', JSON.stringify(allChats));
+    }
+
+    function saveStorage() {
+        localStorage.setItem('lyraChats', JSON.stringify(allChats));
+        localStorage.setItem('lyraStats', JSON.stringify(userStats));
+    }
+
+    function updateStats() {
+        const today = new Date().toDateString();
+        if (userStats.lastDate !== today) {
+            const yesterday = new Date();
+            yesterday.setDate(yesterday.getDate() - 1);
+            if (userStats.lastDate === yesterday.toDateString()) {
+                userStats.streak += 1;
+            } else {
+                userStats.streak = 1;
+            }
+            userStats.lastDate = today;
+        }
+        
+        let headerText = "🔥 Welcome back!";
+        if(userStats.streak > 1) headerText = `<i class="fa-solid fa-fire"></i> ${userStats.streak}-Day Streak!`;
+        if(userStats.msgCount > 50) headerText = `🧠 AI Master (${userStats.msgCount} queries)`;
+        
+        document.getElementById('stats-box').innerHTML = headerText;
+        saveStorage();
+    }
+
+    function renderSidebar() {
+        const list = document.getElementById('chat-history-list');
+        const archList = document.getElementById('archived-list');
+        list.innerHTML = "";
+        archList.innerHTML = "";
+        
+        let activeChats = allChats.filter(c => !c.is_archived);
+        let archivedChats = allChats.filter(c => c.is_archived);
+
+        if (activeChats.length === 0) {
+            list.innerHTML = `<span style="color:#64748b; font-size:0.85rem; padding: 10px; opacity:0.6;">No active conversations.</span>`;
+        }
+        
+        activeChats.sort((a,b) => b.updated_at - a.updated_at).forEach(chat => {
+            list.appendChild(createChatItem(chat));
+        });
+
+        if (archivedChats.length > 0) {
+            document.getElementById('archived-section').style.display = 'block';
+            archivedChats.forEach(chat => archList.appendChild(createChatItem(chat)));
+        } else {
+            document.getElementById('archived-section').style.display = 'none';
+        }
+    }
+
+    function createChatItem(chat) {
+        const div = document.createElement('div');
+        div.className = 'chat-hist-item';
+        if(chat.id === sessionId) div.classList.add('active');
+        
+        div.innerHTML = `
+            <i class="fa-regular fa-message"></i>
+            <span class="chat-title-text" style="flex:1; overflow:hidden; text-overflow:ellipsis;">${chat.title || "New Chat"}</span>
+            <div class="chat-actions">
+                <i class="fa-solid fa-pen chat-action-icon" onclick="event.stopPropagation(); renameChatPrompt('${chat.id}')"></i>
+                <i class="fa-solid fa-box-archive chat-action-icon" onclick="event.stopPropagation(); archiveChat('${chat.id}')" title="Archive"></i>
+                <i class="fa-solid fa-trash chat-action-icon delete" onclick="event.stopPropagation(); deleteChatPrompt('${chat.id}')"></i>
+            </div>
+        `;
+        div.onclick = () => loadChatHistory(chat.id);
+        return div;
+    }
+
+    async function startNewChat() {
+        const newChat = {
+            id: crypto.randomUUID(),
+            title: "New Chat",
+            messages: [],
+            created_at: Date.now() / 1000,
+            updated_at: Date.now() / 1000,
+            is_archived: false
+        };
+        
+        allChats.push(newChat);
+        sessionId = newChat.id;
+        localStorage.setItem('lyra_current_chat_id', sessionId);
+        
+        await fetch('/chats/create', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify(newChat)
+        });
+        
+        chatContainer.innerHTML = '';
+        if(emptyState) chatContainer.appendChild(emptyState);
+        if(emptyState) emptyState.style.display = 'flex';
+        renderSidebar();
+    }
+    
+    function deleteChatPrompt(id) {
+        if(confirm("Erase this conversation from Lyra memory?")) {
+            deleteChat(id);
+        }
+    }
+
+    async function deleteChat(id) {
+        allChats = allChats.filter(c => c.id !== id);
+        if (sessionId === id) startNewChat();
+        renderSidebar();
+        saveStorage();
+        await fetch('/chats/delete', { method: 'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({id}) });
+    }
+
+    async function archiveChat(id) {
+        const chat = allChats.find(c => c.id === id);
+        if(chat) {
+            chat.is_archived = !chat.is_archived;
+            renderSidebar();
+            saveChatToServer(chat);
+            showToast(chat.is_archived ? "Chat Archived" : "Chat Restored");
+        }
+    }
+
+    function renameChatPrompt(id) {
+        const chat = allChats.find(c => c.id === id);
+        const newName = prompt("Rename conversation:", chat.title);
+        if (newName && newName.trim()) {
+            chat.title = newName.trim();
+            renderSidebar();
+            saveChatToServer(chat);
+        }
+    }
+    
+    async function generateAITitle(id, firstMsg) {
+        try {
+            const resp = await fetch('/generate_title', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({message: firstMsg})
+            });
+            const data = await resp.json();
+            const chat = allChats.find(c => c.id === id);
+            if (chat && data.title) {
+                chat.title = data.title;
+                renderSidebar();
+                saveChatToServer(chat);
+            }
+        } catch(e) { console.error("Title generation failed", e); }
+    }
+
+    function submitFeedback(btn, value, msgId) {
+        btn.classList.add('active');
+        btn.style.color = value === 1 ? '#4ade80' : '#f87171';
+        showToast("Feedback ingested. Neutralizing biases...");
+    }
+
+    function loadChatHistory(sid) {
+        const chat = allChats.find(c => c.id === sid);
+        if(!chat) return;
+        
+        sessionId = sid;
+        localStorage.setItem('lyra_current_chat_id', sessionId);
+        chatContainer.innerHTML = '';
+        renderSidebar();
+        
+        if (chat.messages.length === 0) {
+            if(emptyState) chatContainer.appendChild(emptyState);
+            if(emptyState) emptyState.style.display = 'flex';
+        } else {
+            chat.messages.forEach(msg => {
+                const row = document.createElement('div');
+                row.className = 'message-row';
+                if (msg.role === 'user') {
+                    row.innerHTML = `<div class="message user-message">${msg.content.replace(/\n/g, "<br>")}</div>`;
+                } else {
+                    row.innerHTML = `<div class="message bot-message">${msg.content}</div>`;
+                }
+                chatContainer.appendChild(row);
+                row.querySelectorAll('pre code').forEach(block => hljs.highlightElement(block));
+            });
+        }
+        
+        chatContainer.scrollTo({top: chatContainer.scrollHeight, behavior: 'auto'});
+        const history = chat.messages.map(m => ({ role: m.role, content: m.rawContent || m.content }));
+        fetch('/restore_session', { method: 'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({session_id: sid, history: history}) }).catch(()=>{});
+        document.title = `${chat.title || "New Chat"} - Lyra AI`;
+    }
+
+    function openModal(id) { document.getElementById(id).classList.add('active'); }
+    function closeModal(id) { document.getElementById(id).classList.remove('active'); }
+
+    function changeTheme(themeVal) {
+        if (themeVal === 'light') { document.body.classList.add('light-theme'); localStorage.setItem('lyraTheme', 'light'); }
+        else { document.body.classList.remove('light-theme'); localStorage.setItem('lyraTheme', 'dark'); }
+    }
+
+    function changeMode(modeVal) {
+        currentStyle = modeVal;
+        document.querySelectorAll('.style-btn').forEach(b => {
+            b.classList.remove('active');
+            if(b.dataset.style === modeVal) b.classList.add('active');
+        });
+        showToast("Context Override: " + modeVal.charAt(0).toUpperCase() + modeVal.slice(1));
+        localStorage.setItem('lyraMode', modeVal);
+    }
+
+    function updateAvatar(val) { if(val.trim()){ document.getElementById('avatar-chip').innerText = val.toUpperCase().substring(0,2); localStorage.setItem('lyraAvatar', val); } }
+    
+    function saveMemoryProfile() {
+        const val = document.getElementById('memory-input').value;
+        localStorage.setItem('lyraUserContext', val);
+        fetch('/update_memory', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ user_context: val }) });
+        showToast("Memory profile synchronized.");
+    }
+    document.getElementById('memory-input').onblur = saveMemoryProfile;
+
+    window.addEventListener('DOMContentLoaded', () => {
+        const savedTheme = localStorage.getItem('lyraTheme');
+        if (savedTheme) { document.getElementById('theme-selector').value = savedTheme; changeTheme(savedTheme); }
+        const savedAvatar = localStorage.getItem('lyraAvatar');
+        if (savedAvatar) { document.getElementById('avatar-input').value = savedAvatar; document.getElementById('avatar-chip').innerText = savedAvatar.toUpperCase().substring(0,2); }
+        const savedMode = localStorage.getItem('lyraMode');
+        if(savedMode) { document.getElementById('mode-selector').value = savedMode; changeMode(savedMode); }
+        const savedMemory = localStorage.getItem('lyraUserContext');
+        if(savedMemory) { document.getElementById('memory-input').value = savedMemory; }
+        
+        updateStats();
+        
+        if(allChats.length > 0 && !sessionId) {
+            const last = allChats[allChats.length - 1];
+            if(last) {
+                setTimeout(()=> {
+                    showToast(`Resume past chat? <a href="#" style="color:#c084fc;" onclick="loadChatHistory('${last.id}')">Click here</a>`);
+                }, 1000);
+            }
+        }
+        renderSidebar();
+    });
+
+    function b64EncodeUnicode(str) { return btoa(encodeURIComponent(str).replace(/%([0-9A-F]{2})/g, function(match, p1) { return String.fromCharCode('0x' + p1); })); }
+    function b64DecodeUnicode(str) { return decodeURIComponent(Array.prototype.map.call(atob(str), function(c) { return '%' + ('00' + c.charCodeAt(0).toString(16)).slice(-2); }).join('')); }
+
+    marked.setOptions({
+        highlight: function(code, lang) {
+            if (lang && hljs.getLanguage(lang)) return hljs.highlight(code, { language: lang }).value;
+            return hljs.highlightAuto(code).value;
+        }
+    });
+
+    const renderer = new marked.Renderer();
+    renderer.code = function(code, language) {
+        const lang = language ? language : 'text';
+        let highlighted = '';
+        try { highlighted = marked.options.highlight(code, lang); } catch(e) { highlighted = code.replace(/</g, '&lt;').replace(/>/g, '&gt;'); }
+        const base64Code = b64EncodeUnicode(code);
+        return `<div class="code-wrapper">
+            <div class="code-header">
+                <span>${lang}</span>
+                <button class="copy-btn" onclick="copyCodeBase64(this, '${base64Code}')"><i class="fa-regular fa-copy"></i> Copy</button>
+            </div>
+            <pre><code class="hljs language-${lang}">${highlighted}</code></pre>
+        </div>`;
+    };
+    marked.use({ renderer });
+
+    document.querySelectorAll('.style-btn').forEach(btn => {
+        btn.addEventListener('click', (e) => {
+            const m = e.currentTarget.dataset.style;
+            document.getElementById('mode-selector').value = m;
+            changeMode(m);
+        });
+    });
+
+    function loadChip(text) { messageInput.value = text; sendMessage(); }
+    
+    function showToast(msg) {
+        const container = document.getElementById('toast-container');
+        const toast = document.createElement('div');
+        toast.className = 'toast';
+        toast.innerHTML = `<i class="fa-solid fa-circle-check"></i> ${msg}`;
+        container.appendChild(toast);
+        setTimeout(() => { toast.style.opacity = '0'; toast.style.transform = 'translateY(-10px)'; setTimeout(() => toast.remove(), 300); }, 3000);
+    }
+    
+    window.copyCodeBase64 = function(btn, b64) {
+        navigator.clipboard.writeText(b64DecodeUnicode(b64)).then(() => {
+            btn.innerHTML = `<i class="fa-solid fa-check" style="color: #4ade80"></i> Copied`;
+            setTimeout(() => { if (btn.classList.contains('global-copy-btn')) { btn.innerHTML = `<i class="fa-regular fa-copy"></i>`; } else { btn.innerHTML = `<i class="fa-regular fa-copy"></i> Copy`; } }, 2000);
+        });
+    };
+
+    function submitFeedback(btn, vote, msgId) {
+        btn.parentElement.querySelectorAll('.vote-btn').forEach(b => {
+            b.classList.remove('voted');
+            b.style.color = "";
+        });
+        btn.classList.add('voted');
+        btn.style.color = vote === 1 ? "#4ade80" : "#ef4444";
+        
+        fetch('/feedback', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({ id: msgId, vote: vote })
+        }).then(() => showToast("Sentient feedback captured. Adaption engine updated."));
+    }
+
+    function appendUserMessage(text) {
+        if (emptyState) emptyState.style.display = 'none';
+        const msgRow = document.createElement('div');
+        msgRow.className = 'message-row';
+        msgRow.innerHTML = `<div class="message user-message">${text.replace(/\n/g, "<br>")}</div>`;
+        chatContainer.appendChild(msgRow);
+        chatContainer.scrollTo({top: chatContainer.scrollHeight, behavior: 'smooth'});
+    }
+
+    function switchApp(appId) {
+        const targetPage = document.getElementById('app-' + appId);
+        if (!targetPage) {
+            showToast(`Error: App '${appId}' is not yet deployed.`);
+            return;
+        }
+
+        document.querySelectorAll('.app-page').forEach(p => p.classList.remove('active'));
+        targetPage.classList.add('active');
+        
+        document.querySelectorAll('.rail-icon').forEach(i => i.classList.remove('active'));
+        // Direct mapping: Chat=0, Planner=1, Finance=2, Maps=3, Calc=4
+        const railMap = { 'chat': 0, 'planner': 1, 'finance': 2, 'maps': 3, 'calculator': 4 };
+        const icons = document.querySelectorAll('#app-rail .rail-icon');
+        if (railMap[appId] !== undefined) icons[railMap[appId]].classList.add('active');
+        
+        showToast(`Lyra OS: Switched to ${appId.toUpperCase()}`);
+        lyraOS.sync(); // Trigger global refresh
+        
+        if(appId === 'calculator') currentUtility = 'calculator';
+        else if(appId === 'finance') currentUtility = 'finance';
+        else if(appId === 'planner') {
+            currentUtility = 'planner';
+            initPlanner();
+        }
+        else if(appId === 'maps') {
+            currentUtility = 'maps';
+            initMaps();
+        }
+        else currentUtility = 'none';
+    }
+
+    function updateHomeDashboard() {
+        const hour = new Date().getHours();
+        let greeting = "Good Morning";
+        if(hour >= 12 && hour < 17) greeting = "Good Afternoon";
+        else if(hour >= 17) greeting = "Good Evening";
+        
+        document.getElementById('home-greeting').innerText = `${greeting}, Admin`;
+
+        // Update previews from synced data
+        if(plannerTasks.length > 0) {
+            const pending = plannerTasks.filter(t => t.status === 'pending');
+            document.getElementById('home-task-preview').innerText = `${pending.length} pending tasks remaining today.`;
+        }
+        
+        if(financeData.watchlist.length > 0) {
+            document.getElementById('home-stock-preview').innerText = `Monitoring ${financeData.watchlist.length} assets in your watchlist.`;
+        }
+    }
+
+    function handleGlobalSearch(event) {
+        if(event.key === 'Enter') {
+            const query = event.target.value.toLowerCase();
+            event.target.value = '';
+            
+            if(query.includes("plan") || query.includes("schedule")) switchApp('planner');
+            else if(query.includes("+") || query.includes("-") || query.includes("*") || query.includes("/")) switchApp('calculator');
+            else if(query.includes("stock") || query.includes("money")) switchApp('finance');
+            else {
+                switchApp('chat');
+                messageInput.value = query;
+                sendMessage();
+            }
+        }
+    }
+
+    let calcExpression = "";
+    let pinnedResults = [];
+
+    // KEYBOARD LISTENERS
+    window.addEventListener('keydown', (e) => {
+        if (currentUtility !== 'calculator') return;
+        const key = e.key;
+        if (/[0-9.]/.test(key)) calcInput(key);
+        else if (['+', '-', '*', '/', '(', ')', '^'].includes(key)) calcInput(key);
+        else if (key === 'Enter') calcExecute();
+        else if (key === 'Escape' || key === 'Delete') calcClear();
+        else if (key === 'Backspace') {
+            calcExpression = calcExpression.slice(0, -1);
+            document.getElementById('calc-expression').innerText = calcExpression;
+        }
+    });
+
+    function calcInput(v) {
+        calcExpression += v;
+        document.getElementById('calc-expression').innerText = calcExpression;
+        
+        // Auto-show graph for y= functions
+        if (calcExpression.startsWith('y=')) {
+            toggleGraph(true);
+            drawGraph(calcExpression.substring(2));
+        }
+
+        // LIVE PREVIEW (Zero Latency)
+        try {
+            let cleanExpr = calcExpression.replace(/\^/g, "**")
+                                          .replace(/sin\(/g, "Math.sin(")
+                                          .replace(/cos\(/g, "Math.cos(")
+                                          .replace(/tan\(/g, "Math.tan(")
+                                          .replace(/sqrt\(/g, "Math.sqrt(")
+                                          .replace(/pi/g, "Math.PI")
+                                          .replace(/e/g, "Math.E");
+            
+            if (/[\d.]/.test(calcExpression)) {
+                const result = eval(cleanExpr);
+                if (result !== undefined && !isNaN(result)) {
+                    document.getElementById('calc-value').innerText = Number.isInteger(result) ? result : result.toFixed(6);
+                    document.getElementById('calc-value').style.opacity = "0.7";
+                }
+            }
+        } catch(e) {}
+    }
+
+    function toggleGraph(show) {
+        document.getElementById('calc-graph-box').style.display = show ? 'block' : 'none';
+    }
+
+    function drawGraph(expr) {
+        const canvas = document.getElementById('calc-graph-canvas');
+        const ctx = canvas.getContext('2d');
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+        
+        // Draw Axes
+        ctx.strokeStyle = '#2d2d30'; ctx.beginPath();
+        ctx.moveTo(0, 90); ctx.lineTo(240, 90); ctx.moveTo(120, 0); ctx.lineTo(120, 180);
+        ctx.stroke();
+
+        ctx.strokeStyle = '#8b5cf6'; ctx.beginPath();
+        for (let x = -10; x <= 10; x += 0.1) {
+            try {
+                let clean = expr.replace(/x/g, `(${x})`).replace(/\^/g, "**").replace(/sin|cos|tan|sqrt/g, m => `Math.${m}`);
+                let y = eval(clean);
+                let px = 120 + x * 12;
+                let py = 90 - y * 12;
+                if (x === -10) ctx.moveTo(px, py); else ctx.lineTo(px, py);
+            } catch(e) {}
+        }
+        ctx.stroke();
+    }
+
+    async function calcExecute() {
+        const payload = calcExpression;
+        if (!payload) return;
+        
+        document.getElementById('calc-value').innerText = "Solving...";
+        
+        try {
+            const resp = await fetch('/chat_stream', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ message: `[UTIL: CALCULATOR] ${payload}`, provider: 'smart', session_id: sessionId })
+            });
+
+            const reader = resp.body.getReader();
+            const decoder = new TextDecoder();
+            let fullText = "";
+
+            while(true) {
+                const {done, value} = await reader.read();
+                if(done) break;
+                fullText += decoder.decode(value);
+            }
+            
+            renderCalcResult(payload, fullText);
+            calcExpression = "";
+        } catch (e) {
+            showToast("Computational node fallback initiated...");
+        }
+    }
+
+    function renderCalcResult(expr, res) {
+        const valueMatch = res.match(/\*\*Answer\*\*:\s*([^\n]+)/i);
+        const resultVal = valueMatch ? valueMatch[1].trim() : "...";
+        
+        // Broadcast into OS State
+        lyraOS.update({ 
+            last_calculation: { expression: expr, result: resultVal }
+        });
+        
+        document.getElementById('calc-value').innerText = resultVal;
+        document.getElementById('calc-value').style.opacity = "1.0";
+        
+        const hist = document.getElementById('calc-history');
+        const card = document.createElement('div');
+        card.className = 'place-card'; // Reuse style
+        card.innerHTML = `
+            <div style="font-family:'Courier Prime'; color:var(--accent-purple); font-size:0.75rem;">${expr}</div>
+            <div style="color:#fff; font-weight:700; margin-top:5px;">= ${resultVal}</div>
+        `;
+        hist.prepend(card);
+        
+        // Update Variables UI if assignment
+        if (expr.includes('=')) {
+            const parts = expr.split('=');
+            const varName = parts[0].trim();
+            updateVarUI(varName, resultVal);
+            
+            // Sync variable to System Parameters
+            const newParams = {...lyraOS.state.active_parameters};
+            newParams[varName] = resultVal;
+            lyraOS.update({ active_parameters: newParams });
+        }
+    }
+
+    function renderCalculator() {
+        const resEl = document.getElementById('calc-value');
+        if (resEl && lyraOS.state.last_calculation.result !== "0") {
+            // Only update if not in middle of typing
+            if (calcExpression === "") {
+                resEl.innerText = lyraOS.state.last_calculation.result;
+            }
+        }
+    }
+
+    function updateVarUI(name, val) {
+        const area = document.getElementById('calc-variables');
+        if (area.innerHTML.includes('No variables')) area.innerHTML = "";
+        
+        const chip = document.createElement('div');
+        chip.style = "background:rgba(139,92,246,0.1); border:1px solid rgba(139,92,246,0.2); padding:5px 10px; border-radius:8px; font-size:0.75rem; color:var(--accent-light);";
+        chip.innerHTML = `<strong>${name}</strong> = ${val}`;
+        area.appendChild(chip);
+    }
+
+    function calcClear() {
+        calcExpression = "";
+        document.getElementById('calc-expression').innerText = "";
+        document.getElementById('calc-value').innerText = "0";
+        toggleGraph(false);
+    }
+
+    function startCalcVoice() {
+        const recognition = new (window.SpeechRecognition || window.webkitSpeechRecognition)();
+        recognition.lang = 'en-US';
+        const micBtn = document.getElementById('calc-mic');
+        
+        recognition.onstart = () => {
+            micBtn.classList.add('active');
+            showToast("Listening for math commands...");
+        };
+        
+        recognition.onresult = (event) => {
+            const transcript = event.results[0][0].transcript;
+            showToast(`Heard: "${transcript}"`);
+            
+            // Send to backend for parsing and execution
+            calcExpression = transcript;
+            document.getElementById('calc-expression').innerText = `Spoken: ${transcript}`;
+            calcExecute();
+        };
+        
+        recognition.onend = () => {
+            micBtn.classList.remove('active');
+        };
+        
+        recognition.onerror = () => {
+            micBtn.classList.remove('active');
+            showToast("Voice math failed. Try again.");
+        };
+        
+        recognition.start();
+    }
+
+    function toggleSwarmSettings(enabled) {
+        showToast(enabled ? "Multi-Agent Swarm (MAS) Enabled." : "Single Agent Mode Active.");
+        fetch('/evolution/approve', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({ action: 'speed', value: enabled ? 'true' : 'false', index: -1 })
+        });
+    }
+
+    async function handleStreamingCall(text, provider, styleControl) {
+        userStats.msgCount++;
+        userStats.lastDate = new Date().toDateString();
+        saveStorage();
+        updateStats();
+        
+        const activeChat = allChats.find(c => c.id === sessionId);
+        if (!activeChat) {
+            startNewChat().then(() => handleStreamingCall(text, provider, styleControl));
+            return;
+        }
+
+        activeChat.messages.push({ role: 'user', content: text });
+        activeChat.updated_at = Date.now() / 1000;
+        saveChatToServer(activeChat);
+        renderSidebar();
+
+        messageInput.disabled = true;
+        sendBtn.disabled = true;
+        sendBtn.innerHTML = '<i class="fa-solid fa-circle-notch fa-spin"></i>';
+        
+        if (text) {
+            // AUTO STOP DICTATION ON SEND
+            if (isDictating && dictateRecognition) dictateRecognition.stop();
+
+            const msgRow = document.createElement('div');
+        msgRow.className = 'message-row';
+        
+        const msgDiv = document.createElement('div');
+        msgDiv.className = 'message bot-message';
+        
+        // MULTIMODAL IMAGE DETECTION & UI LOADER
+        const isImageGen = text.toLowerCase().includes("generate image") || text.toLowerCase().includes("draw ") || text.toLowerCase().includes("image of") || text.toLowerCase().includes("make a picture") || text.toLowerCase().includes("create image") || text.toLowerCase().includes("create a picture");
+        
+        let modeLabel = provider === "smart" ? "SMART 4.0" : provider === "agent" ? "AUTO GEN" : provider.toUpperCase();
+        let osIndicators = "";
+        
+        if (text.includes("[UTIL: PLANNER]")) osIndicators += `<span><i class="fa-solid fa-calendar-check"></i> Planner Hive</span>`;
+        if (text.includes("[UTIL: FINANCE]")) osIndicators += `<span><i class="fa-solid fa-chart-line"></i> Market Intelligence</span>`;
+        if (text.includes("[UTIL: CALCULATOR]")) osIndicators += `<span><i class="fa-solid fa-calculator"></i> Logic Engine</span>`;
+        
+        if (isImageGen) {
+            msgDiv.innerHTML = `<div class="mode-badge"><i class="fa-solid fa-wand-magic-sparkles"></i> IMAGEN ENGINE</div>
+                                <div class="thinking-state"><i class="fa-solid fa-palette fa-spin-pulse"></i> Deep-Learning Visual Synthesis...</div>
+                                <div class="skeleton-loader"><div class="skeleton-bar" style="width:100%; height:200px;"></div></div>`;
+        } else {
+            msgDiv.innerHTML = `<div class="mode-badge"><i class="fa-solid fa-microchip"></i> ${modeLabel} ${osIndicators ? ' | ' + osIndicators : ''}</div>
+                                <div class="thinking-state"><i class="fa-solid fa-brain-circuit fa-fade"></i> ${osIndicators ? 'Synthesizing Cross-App Intelligence...' : 'Aligning Neural Pathways...'}</div>
+                                <div class="skeleton-loader">
+                                    <div class="skeleton-bar" style="width:100%"></div>
+                                    <div class="skeleton-bar" style="width:85%"></div>
+                                    <div class="skeleton-bar" style="width:40%"></div>
+                                </div>`;
+        }
+                            
+        msgRow.appendChild(msgDiv);
+        chatContainer.appendChild(msgRow);
+        chatContainer.scrollTo({top: chatContainer.scrollHeight, behavior: 'smooth'});
+
+        try {
+            const response = await fetch('/chat_stream', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ message: text, provider: provider, mode: styleControl, session_id: sessionId, is_voice: isVoiceMode, image_quality: document.getElementById('image-quality-select').value })
+            });
+
+            // MULTIMODAL JSON INTERCEPT
+            const contentType = response.headers.get("content-type");
+            if (contentType && contentType.includes("application/json")) {
+                const jsonObj = await response.json();
+                
+                if (jsonObj.type === "image") {
+                    msgDiv.innerHTML = `
+                        <div style="font-weight:600; color:#4ade80; margin-bottom:12px;"><i class="fa-solid fa-wand-magic-sparkles"></i> NVIDIA Vision Generation</div>
+                        <img src="${jsonObj.data}" alt="Nvidia AI Generated" style="width:100%; max-width:600px; border-radius:12px; box-shadow:0 10px 30px rgba(0,0,0,0.5); object-fit:contain; border: 1px solid rgba(255,255,255,0.1);" />
+                        <div style="font-size:0.85rem; color:#8c85a1; margin-top:10px; font-style:italic;">"${jsonObj.prompt}"</div>
+                        <div style="display:flex; gap:10px; margin-top:15px; flex-wrap:wrap;">
+                            <button onclick="requestVariation('${jsonObj.img_id}', '${jsonObj.prompt.replace(/'/g, "\\'")}')" class="style-btn"><i class="fa-solid fa-shuffle"></i> Variations</button>
+                            <button onclick="requestEdit('${jsonObj.img_id}', '${jsonObj.prompt.replace(/'/g, "\\'")}')" class="style-btn"><i class="fa-solid fa-pen"></i> Edit Mode</button>
+                            <button onclick="requestStyle('${jsonObj.img_id}', '${jsonObj.prompt.replace(/'/g, "\\'")}', 'Realistic')" class="style-btn"><i class="fa-solid fa-camera"></i> Realistic</button>
+                            <button onclick="requestStyle('${jsonObj.img_id}', '${jsonObj.prompt.replace(/'/g, "\\'")}', 'Sketch')" class="style-btn"><i class="fa-solid fa-pencil"></i> Sketch</button>
+                            <button onclick="requestStyle('${jsonObj.img_id}', '${jsonObj.prompt.replace(/'/g, "\\'")}', 'Cyberpunk')" class="style-btn"><i class="fa-solid fa-robot"></i> Cyberpunk</button>
+                            <button onclick="requestStyle('${jsonObj.img_id}', '${jsonObj.prompt.replace(/'/g, "\\'")}', 'Anime')" class="style-btn"><i class="fa-solid fa-film"></i> Anime</button>
+                            <button onclick="requestStyle('${jsonObj.img_id}', '${jsonObj.prompt.replace(/'/g, "\\'")}', 'Cinematic')" class="style-btn"><i class="fa-solid fa-video"></i> Cinematic</button>
+                            <a href="${jsonObj.data}" download="lyra-generation.png" class="style-btn primary"><i class="fa-solid fa-download"></i> Save</a>
+                        </div>
+                    `;
+                    activeChat.messages.push({ role: 'assistant', content: `[Generated Image: ${jsonObj.prompt}]`, rawContent: `[Generated Image]` });
+                    saveChatToServer(activeChat);
+                } else if (jsonObj.type === "image_grid") {
+                    let gridHtm = `<div style="font-weight:600; color:#4ade80; margin-bottom:12px;"><i class="fa-solid fa-layer-group"></i> Visual Variations Generated</div>
+                                   <div class="img-grid">`;
+                    jsonObj.data.forEach(img => {
+                        gridHtm += `<img src="${img}" style="width:100%; border-radius:12px; box-shadow:0 5px 15px rgba(0,0,0,0.4); border: 1px solid rgba(255,255,255,0.1); cursor:pointer;" onclick="window.open('${img}')" />`;
+                    });
+                    gridHtm += `</div>`;
+                    msgDiv.innerHTML = gridHtm;
+                    activeChat.messages.push({ role: 'assistant', content: `[Generated Variations: ${jsonObj.prompt}]`, rawContent: `[Generated Variations]` });
+                    saveChatToServer(activeChat);
+                } else if (jsonObj.type === "error") {
+                    msgDiv.innerHTML = `<span style="color:#ef4444;"><i class="fa-solid fa-triangle-exclamation"></i> ${jsonObj.data}</span>`;
+                }
+                
+                // Add Iteration & Export UI Row
+                const actionRow = document.createElement('div');
+                actionRow.className = 'iteration-row';
+                actionRow.innerHTML = `
+                    <button class="action-pill" onclick="iterate('IMPROVE')"><i class="fa-solid fa-arrow-trend-up"></i> Improve</button>
+                    <button class="action-pill" onclick="iterate('SIMPLIFY')"><i class="fa-solid fa-compress"></i> Simplify</button>
+                    <button class="action-pill" onclick="iterate('CREATIVE')"><i class="fa-solid fa-wand-magic"></i> Creative</button>
+                    <div style="flex:1"></div>
+                    <button class="action-pill export" onclick="copyToClipboard(\`${jsonObj.prompt || jsonObj.data || ''}\`)"><i class="fa-solid fa-copy"></i> Copy</button>
+                    <button class="action-pill export" onclick="downloadText(\`${jsonObj.prompt || jsonObj.data || ''}\`)"><i class="fa-solid fa-download"></i> Save</button>
+                `;
+                msgDiv.appendChild(actionRow);
+                
+                messageInput.disabled = false;
+                sendBtn.disabled = false;
+                sendBtn.innerHTML = '<i class="fa-solid fa-arrow-up"></i>';
+                chatContainer.scrollTo({top: chatContainer.scrollHeight, behavior: 'smooth'});
+                
+                if (activeChat.messages.length === 2 && activeChat.title === "New Chat") {
+                    generateAITitle(sessionId, text);
+                }
+                return;
+            }
+
+            const reader = response.body.getReader();
+            const decoder = new TextDecoder('utf-8');
+            let done = false;
+            let fullText = "";
+            let isFirstChunk = true;
+
+            while (!done) {
+                const { value, done: readerDone } = await reader.read();
+                done = readerDone;
+                
+                if (value) {
+                    if (isFirstChunk) { msgDiv.innerHTML = ""; isFirstChunk = false; }
+                    
+                    const chunkBuffer = decoder.decode(value, {stream: true});
+                    fullText += chunkBuffer;
+                    
+                    msgDiv.innerHTML = DOMPurify.sanitize(marked.parse(fullText), { ADD_ATTR: ['onclick', 'class'] }) + '<span class="streaming-cursor"></span>';
+                    
+                    const isScrolledToBottom = chatContainer.scrollHeight - chatContainer.clientHeight <= chatContainer.scrollTop + 80;
+                    if (isScrolledToBottom) chatContainer.scrollTop = chatContainer.scrollHeight;
+                }
+            }
+            
+            const finalFormat = DOMPurify.sanitize(marked.parse(fullText), { ADD_ATTR: ['onclick', 'class'] });
+            
+            // RAG Attribution UI
+            let ragIndicator = "";
+            if (fullText.includes("[SOURCE:")) {
+                const icon = fullText.includes("VISUAL") ? "fa-eye" : "fa-file-shield";
+                const label = fullText.includes("VISUAL") ? "Answer based on visual & text analysis" : "Verified answer based on documents";
+                ragIndicator = `<div style="font-size:0.75rem; color:#4ade80; margin-bottom:8px; opacity:0.8;"><i class="fa-solid ${icon}"></i> ${label}</div>`;
+            }
+
+            msgDiv.innerHTML = `
+                ${ragIndicator}
+                ${finalFormat}
+                <div class="iteration-row">
+                    <button class="action-pill" onclick="iterate('IMPROVE')"><i class="fa-solid fa-arrow-trend-up"></i> Improve</button>
+                    <button class="action-pill" onclick="iterate('SIMPLIFY')"><i class="fa-solid fa-compress"></i> Simplify</button>
+                    <button class="action-pill" onclick="iterate('CREATIVE')"><i class="fa-solid fa-wand-magic"></i> Creative</button>
+                    <div style="flex:1"></div>
+                    <div class="feedback-group">
+                        <button class="action-pill vote-btn" onclick="submitFeedback(this, 1, '${Date.now()}')"><i class="fa-regular fa-thumbs-up"></i></button>
+                        <button class="action-pill vote-btn" onclick="submitFeedback(this, -1, '${Date.now()}')"><i class="fa-regular fa-thumbs-down"></i></button>
+                    </div>
+                    <button class="action-pill export" onclick="copyToClipboard(\`${fullText.replace(/`/g, '\\\\`').replace(/\$/g, '\\\\$')}\`)"><i class="fa-solid fa-copy"></i> Copy</button>
+                    <button class="action-pill export" onclick="downloadText(\`${fullText.replace(/`/g, '\\\\`').replace(/\$/g, '\\\\$')}\`)"><i class="fa-solid fa-download"></i> Save</button>
+                </div>
+            `;
+
+            if(isVoiceMode) speakLyraResponse(fullText);
+            
+            const followUpHtml = `
+                <div class="follow-up-actions">
+                    <div class="follow-up-pill" onclick="loadChip('Explain that simpler please')"><i class="fa-solid fa-bolt"></i> Explain simpler</div>
+                    <div class="follow-up-pill" onclick="loadChip('Give me some examples')"><i class="fa-solid fa-list"></i> Give examples</div>
+                    <div class="follow-up-pill" onclick="loadChip('Make it significantly shorter')"><i class="fa-solid fa-compress"></i> Make it shorter</div>
+                </div>
+            `;
+            msgRow.insertAdjacentHTML('beforeend', followUpHtml);
+            
+            msgRow.querySelectorAll('pre code').forEach(block => hljs.highlightElement(block));
+            chatContainer.scrollTo({top: chatContainer.scrollHeight, behavior: 'smooth'});
+            
+            activeChat.messages.push({ role: 'assistant', content: finalFormat, rawContent: fullText });
+            saveChatToServer(activeChat);
+
+            if (activeChat.messages.length === 2 && activeChat.title === "New Chat") {
+                generateAITitle(sessionId, text);
+            }
+            
+            playTTS(fullText);
+
+        } catch (error) {
+            console.error(error);
+            msgDiv.innerHTML = "⚠ Streaming initialization failed. Local bounds error.";
+            showToast("Connection closed.");
+        }
+        
+        messageInput.disabled = false;
+        sendBtn.disabled = false;
+        sendBtn.innerHTML = '<i class="fa-solid fa-arrow-up"></i>';
+        
+            if (!isVoiceMode) {
+                messageInput.focus();
+            }
+        }
+    }
+    
+    let uploadedFileContent = "";
+
+    async function handleFileUpload(input) {
+        if (!input.files || !input.files[0]) return;
+        const file = input.files[0];
+        const isImg = file.type.startsWith('image/');
+        const endpoint = isImg ? '/upload_image' : '/upload_file';
+        const field = isImg ? 'image' : 'file';
+        
+        const formData = new FormData();
+        formData.append(field, file);
+        
+        showToast(isImg ? "Initializing Multi-Step Vision..." : "Indexing Knowledge...");
+        try {
+            const sessId = localStorage.getItem('lyra_session_id') || 'default';
+            const resp = await fetch(endpoint, { 
+                method: 'POST', 
+                body: formData,
+                headers: { 'X-Session-ID': sessId }
+            });
+            if (!resp.ok) throw new Error("Upload failed");
+            const data = await resp.json();
+            
+            if (isImg && data.job_id) {
+                // VISUAL SHIMMER UI
+                const msgId = 'vision-' + data.job_id;
+                const msgRow = document.createElement('div');
+                msgRow.className = 'message-row';
+                msgRow.id = msgId;
+                msgRow.innerHTML = `
+                    <div class="message bot-message shimmer-box" style="border-left: 4px solid #8b5cf6;">
+                        <div style="font-size:0.75rem; color:#8b5cf6; margin-bottom:8px;"><i class="fa-solid fa-eye-slash"></i> Analyzing Image Intelligence...</div>
+                        <img src="${URL.createObjectURL(file)}" style="max-width:200px; border-radius:8px; margin-bottom:10px; opacity:0.5;">
+                        <div class="shimmer" style="height:15px; width:100%; border-radius:4px; margin-bottom:8px;"></div>
+                        <div class="shimmer" style="height:15px; width:80%; border-radius:4px;"></div>
+                    </div>
+                `;
+                chatContainer.appendChild(msgRow);
+                chatContainer.scrollTo({top: chatContainer.scrollHeight, behavior: 'smooth'});
+
+                // POLLING FOR COMPLETION
+                const pollManager = async () => {
+                    const sResp = await fetch('/vision_status/' + data.job_id);
+                    const status = await sResp.json();
+                    
+                    const statusMapping = {
+                        'analyzing': '<i class="fa-solid fa-microscope"></i> Extracting Image Metadata...',
+                        'synthesizing': '<i class="fa-solid fa-brain-circuit"></i> Processing Logic & Context...',
+                        'complete': '<i class="fa-solid fa-eye"></i> Visual Insight Complete'
+                    };
+
+                    if (status.status === 'complete') {
+                        document.getElementById(msgId).innerHTML = `
+                             <div class="message bot-message" style="border-left: 4px solid #8b5cf6;">
+                                <div style="font-size:0.75rem; color:#8b5cf6; margin-bottom:8px;">${statusMapping['complete']}</div>
+                                <img src="${URL.createObjectURL(file)}" style="max-width:200px; border-radius:8px; margin-bottom:10px;">
+                                ${marked.parse(status.result)}
+                                <details style="font-size:0.7rem; color:gray; cursor:pointer;"><summary>View Structured Data</summary><pre style="white-space:pre-wrap;">${status.metadata}</pre></details>
+                            </div>
+                        `;
+                        showToast("Visual Reasoning Finalized.");
+                    } else {
+                        const statusText = statusMapping[status.status] || "Processing Intelligence...";
+                        document.getElementById(msgId).querySelector('div').innerHTML = statusText;
+                        setTimeout(pollManager, 1200);
+                    }
+                };
+                pollManager();
+            } else {
+                uploadedFileContent = data.filename;
+                const preview = document.getElementById('attachment-preview');
+                preview.style.display = 'block';
+                preview.innerHTML = `<i class="fa-solid fa-brain"></i> ${data.filename} indexed. <i class="fa-solid fa-xmark" style="float:right; cursor:pointer" onclick="clearAttachment()"></i>`;
+                showToast("Insights Synchronized.");
+            }
+        } catch (e) { console.error(e); showToast("Upload failure."); }
+    }
+
+    function clearAttachment() {
+        uploadedFileContent = "";
+        const preview = document.getElementById('attachment-preview');
+        if (preview) preview.style.display = 'none';
+        const uploader = document.getElementById('file-uploader');
+        if (uploader) uploader.value = "";
+    }
+
+    function toggleAgentMode(cb) {
+        if (cb.checked) {
+            providerSelect.value = "agent";
+            messageInput.placeholder = "Enter your goal (e.g. Build a landing page)...";
+            showToast("Lyra Agent Mode: Sequence Planning Activated.");
+        } else {
+            providerSelect.value = "smart";
+            messageInput.placeholder = "Message Lyra AI...";
+        }
+    }
+
+    function setUtility(u) {
+        currentUtility = u;
+        document.querySelectorAll('.utility-card').forEach(c => c.classList.remove('active'));
+        if(u !== 'none') {
+            document.getElementById('util-'+u).classList.add('active');
+            messageInput.placeholder = `[Utility: ${u.toUpperCase()}] Enter instruction...`;
+            showToast(`${u.charAt(0).toUpperCase() + u.slice(1)} Mode Activated.`);
+        } else {
+            messageInput.placeholder = "Message Lyra AI...";
+        }
+        closeModal('utility-modal');
+    }
+
+    async function sendMessage() {
+        let text = messageInput.value.trim();
+        if (!text) return;
+        
+        // SENTIENT INTENT ROUTER
+        if (currentUtility === "none" && !text.startsWith("[UTIL:")) {
+            const query = text.toLowerCase();
+            if (/\b(plan|schedule|task|calendar|todo|day)\b/.test(query)) {
+                text = `[UTIL: PLANNER] ${text}`;
+                showToast("Activating Planner Intelligence...");
+            } else if (/\b(stock|price|market|invest|buy|sell|portfolio)\b/.test(query)) {
+                text = `[UTIL: FINANCE] ${text}`;
+                showToast("Syncing Market Analytics...");
+            } else if (/\b(calculate|math|solve|plus|minus|total|interest)\b/.test(query)) {
+                text = `[UTIL: CALCULATOR] ${text}`;
+                showToast("Booting Precision Math Solver...");
+            }
+        } else if (currentUtility !== "none" && !text.startsWith("[UTIL:")) {
+            text = `[UTIL: ${currentUtility.toUpperCase()}] ${text}`;
+        }
+        clearAttachment();
+        const provider = providerSelect.value;
+        if (!text || sendBtn.disabled) return;
+        messageInput.value = '';
+        appendUserMessage(text);
+        setTimeout(() => handleStreamingCall(text, provider, currentStyle), 10);
+    }
+    
+    sendBtn.addEventListener('click', () => sendMessage());
+    messageInput.addEventListener('keypress', function(e) { if (e.key === 'Enter') { e.preventDefault(); sendMessage(); }});
+
+    /* MAPS JS ENGINE */
+    let map;
+    let markers = [];
+    let userLocation = { lat: 12.9716, lon: 77.5946 }; // Default: Bengaluru
+    let routePolyline;
+
+    function initMaps() {
+        if (map) return; // Already init
+        map = L.map('map-canvas').setView([userLocation.lat, userLocation.lon], 13);
+        L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+            attribution: '© OpenStreetMap contributors'
+        }).addTo(map);
+        
+        // Auto-locate
+        centerOnUser();
+    }
+
+    async function searchPlaces() {
+        const query = document.getElementById('map-search-input').value;
+        if (!query) return;
+        
+        showToast(`Searching for "${query}"...`);
+        const resp = await fetch(`https://nominatim.openstreetmap.org/search?format=json&q=${encodeURIComponent(query)}&limit=10`);
+        const data = await resp.json();
+        
+        renderPlaces(data);
+        getMapsAIRecommendation(query, data);
+    }
+
+    function renderPlaces(places) {
+        markers.forEach(m => map.removeLayer(m));
+        markers = [];
+        const list = document.getElementById('place-results');
+        list.innerHTML = "";
+        
+        if (places.length === 0) {
+            list.innerHTML = `<div style="padding:20px; color:#64748b;">No logical matches found in this region.</div>`;
+            return;
+        }
+
+        places.forEach(p => {
+            const lat = parseFloat(p.lat);
+            const lon = parseFloat(p.lon);
+            const marker = L.marker([lat, lon]).addTo(map)
+                .bindPopup(`<strong>${p.display_name.split(',')[0]}</strong><br>${p.display_name}`);
+            markers.push(marker);
+
+            const card = document.createElement('div');
+            card.className = 'place-card';
+            card.innerHTML = `
+                <div class="name">${p.display_name.split(',')[0]}</div>
+                <div class="address">${p.display_name}</div>
+            `;
+            card.onclick = () => {
+                map.setView([lat, lon], 16);
+                marker.openPopup();
+            };
+            list.appendChild(card);
+        });
+
+        if (places.length > 0) {
+            map.fitBounds(L.featureGroup(markers).getBounds());
+        }
+    }
+
+    async function centerOnUser() {
+        if (!navigator.geolocation) return showToast("Geolocation unsupported by your OS node.");
+        
+        navigator.geolocation.getCurrentPosition(pos => {
+            userLocation = { lat: pos.coords.latitude, lon: pos.coords.longitude };
+            map.setView([userLocation.lat, userLocation.lon], 14);
+            L.circle([userLocation.lat, userLocation.lon], { radius: 200, color: '#8b5cf6' }).addTo(map);
+        }, err => {
+            showToast("Location access denied. Using default coordinates.");
+        });
+    }
+
+    async function calculateRoute() {
+        const dest = document.getElementById('route-to').value;
+        if (!dest) return showToast("Please specify a logical destination.");
+        
+        // Geocode destination
+        const resp = await fetch(`https://nominatim.openstreetmap.org/search?format=json&q=${encodeURIComponent(dest)}&limit=1`);
+        const data = await resp.json();
+        
+        if (data.length === 0) return showToast("Destination location untraceable.");
+        
+        const target = { lat: parseFloat(data[0].lat), lon: parseFloat(data[0].lon) };
+        
+        // Simple OSRM routing
+        const routeResp = await fetch(`https://router.project-osrm.org/route/v1/driving/${userLocation.lon},${userLocation.lat};${target.lon},${target.lat}?overview=full&geometries=geojson`);
+        const routeData = await routeResp.json();
+        
+        if (routeData.routes && routeData.routes.length > 0) {
+            const route = routeData.routes[0];
+            if (routePolyline) map.removeLayer(routePolyline);
+            
+            routePolyline = L.geoJSON(route.geometry, { style: { color: '#8b5cf6', weight: 5 } }).addTo(map);
+            map.fitBounds(routePolyline.getBounds());
+            
+            const dist = (route.distance / 1000).toFixed(2);
+            const time = Math.round(route.duration / 60);
+            document.getElementById('route-info').innerHTML = `
+                🏁 ${dist} km | ⏳ ${time} mins est.
+            `;
+            showToast(`Optimal path calculated: ${dist} km`);
+        }
+    }
+
+    async function getMapsAIRecommendation(query, results) {
+        const panel = document.getElementById('maps-ai-recommendations');
+        panel.innerHTML = `<div style="padding:20px;">Lyra is analyzing the local district...</div>`;
+        
+        const context = results.slice(0, 5).map(r => r.display_name).join("\n");
+        const chatResp = await fetch('/chat_stream', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({
+                message: `Analyze these top results for "${query}" near ${userLocation.lat}, ${userLocation.lon} and provide 3 sentient recommendations. Use exactly this format: [RECOM] Rank: Title | Why: Reason`,
+                provider: 'smart',
+                session_id: sessionId
+            })
+        });
+
+        const reader = chatResp.body.getReader();
+        const decoder = new TextDecoder();
+        let fullText = "";
+        panel.innerHTML = ""; // Clear loader
+
+        while (true) {
+            const {done, value} = await reader.read();
+            if (done) break;
+            fullText += decoder.decode(value);
+            // Partial render logic if needed, or wait for finish
+        }
+        
+        // Simple extraction for the cards
+        const items = fullText.split('[RECOM]').slice(1);
+        items.forEach(it => {
+            const parts = it.split('|');
+            const rankTitle = parts[0] ? parts[0].trim() : "Optimal Choice";
+            const why = parts[1] ? parts[1].replace('Why:', '').trim() : "...";
+            
+            const card = document.createElement('div');
+            card.className = 'recom-item';
+            card.innerHTML = `
+                <div class="rank">${rankTitle.split(':')[0]} RECOMMENDED</div>
+                <div style="font-weight:700; color:#fff; margin-bottom:5px;">${rankTitle.split(':')[1] || rankTitle}</div>
+                <div style="font-size:0.75rem; color:#64748b;">${why}</div>
+            `;
+            panel.appendChild(card);
+        });
+    }
+
+    // ---------------------------------
+    // PLANNER APPLICATION LOGIC (V2: TRAVEL & HUB)
+    // ---------------------------------
+    let plannerTasks = [];
+    let plannerMode = 'SCHEDULE'; // SCHEDULE | TRAVEL | DISCOVERY
+    let plannerTripData = null;
+
+    async function initPlanner() {
+        try {
+            const resp = await fetch('/planner/data');
+            const data = await resp.json();
+            plannerTasks = data.tasks || [];
+            renderPlanner();
+        } catch (e) { console.error("Planner Init Failed", e); }
+    }
+
+    function switchPlannerMode(mode) {
+        plannerMode = mode;
+        document.querySelectorAll('.planner-nav-item').forEach(i => i.classList.remove('active'));
+        // Find matching item by text
+        const navItems = document.querySelectorAll('.planner-nav-item');
+        if(mode === 'SCHEDULE') navItems[0].classList.add('active');
+        else if(mode === 'TRAVEL') navItems[1].classList.add('active');
+        else if(mode === 'DISCOVERY') navItems[2].classList.add('active');
+
+        document.getElementById('planner-board-title').innerText = mode === 'SCHEDULE' ? 'Daily Orchestration 📅' : mode === 'TRAVEL' ? 'Trip Architecture ✈️' : 'Discovery Engine 🏨';
+        
+        if(mode === 'DISCOVERY') renderDiscovery();
+        else renderPlanner();
+    }
+
+    const discoveryCache = { hotels: null, events: null, lastCity: "" };
+
+    async function generateTripPlan() {
+        const goalInput = document.getElementById('planner-goal-input');
+        const goal = goalInput.value.trim();
+        if(!goal) return showToast("Define your destination for Lyra to architect.");
+        
+        showToast("Lyra is architecting your voyage...");
+        goalInput.disabled = true;
+
+        try {
+            const resp = await fetch('/planner/trip', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({ goal: goal })
+            });
+            const data = await resp.json();
+            if(data.status === 'success') {
+                plannerTripData = data.data;
+                switchPlannerMode('TRAVEL');
+                lyraOS.sync(); // Sync global budget
+                showToast(`Architecture Ready. Est. Cost: ₹${data.summary.cost.toLocaleString()}`);
+            } else {
+                showToast("Architect generated narrative plan. Review in AI Panel.");
+                document.getElementById('planner-suggestions').innerHTML = `<div class="suggestion-card">${data.text}</div>`;
+            }
+        } catch (e) { showToast("Voyage orchestration failed."); }
+        finally { goalInput.disabled = false; }
+    }
+
+    function renderPlanner() {
+        const timeline = document.getElementById('planner-timeline');
+        if(!timeline) return;
+        
+        if(plannerMode === 'TRAVEL' && plannerTripData) {
+            renderTravelPlan();
+            return;
+        }
+
+        if(plannerTasks.length === 0) {
+            timeline.innerHTML = '<div class="timeline-empty">Awaiting orchestration ingestion...</div>';
+            return;
+        }
+
+        timeline.innerHTML = plannerTasks.map((t, idx) => `
+            <div class="timeline-item ${t.status === 'done' ? 'done' : ''}">
+                <div class="item-time">${t.time}</div>
+                <div class="item-task">${t.task}</div>
+                <div class="status-check ${t.status === 'done' ? 'checked' : ''}" onclick="toggleTask(${idx})">
+                    ${t.status === 'done' ? '<i class="fa-solid fa-check"></i>' : ''}
+                </div>
+            </div>
+        `).join('');
+    }
+
+    function renderTravelPlan() {
+        const timeline = document.getElementById('planner-timeline');
+        if(!plannerTripData) return;
+        
+        timeline.innerHTML = plannerTripData.map(day => `
+            <div class="trip-itinerary-day">
+                <h3 style="color:#fff; font-size:1.1rem; margin-bottom:20px;">Day ${day.day}</h3>
+                ${day.steps.map(step => `
+                    <div class="itinerary-step">
+                        <div class="itinerary-time">${step.time}</div>
+                        <div class="itinerary-dot"></div>
+                        <div class="itinerary-content">
+                            <div style="color:var(--accent-light); font-weight:700;">${step.activity}</div>
+                            <div style="font-size:0.7rem; color:#64748b; margin-top:5px; display:flex; align-items:center; gap:5px;">
+                                <i class="fa-solid fa-circle-info" style="font-size:0.6rem;"></i> 
+                                Estimated Cost: ₹${step.cost ? parseInt(step.cost).toLocaleString() : '---'}
+                            </div>
+                        </div>
+                    </div>
+                `).join('')}
+            </div>
+        `).join('');
+    }
+
+    async function renderDiscovery() {
+        const timeline = document.getElementById('planner-timeline');
+        const city = "Goa"; // Contextually fetched in prod
+        
+        // Final Answer: Use Cache for Instant Load
+        if (discoveryCache.hotels && discoveryCache.lastCity === city) {
+            populateDiscoveryUI(discoveryCache.hotels, discoveryCache.events);
+            return;
+        }
+
+        timeline.innerHTML = `
+            <div style="margin-bottom:25px;">
+                <h4 style="font-size:0.8rem; color:#64748b; margin-bottom:15px;">TOP HOTELS NEARBY (ESTIMATED)</h4>
+                <div id="hotel-grid" class="discovery-grid">
+                    ${Array(3).fill('<div class="skeleton-box" style="height:150px; width:100%;"></div>').join('')}
+                </div>
+            </div>
+            <div>
+                <h4 style="font-size:0.8rem; color:#64748b; margin-bottom:15px;">EVENTS & CONCERTS</h4>
+                <div id="event-grid" class="discovery-grid">
+                    ${Array(3).fill('<div class="skeleton-box" style="height:150px; width:100%;"></div>').join('')}
+                </div>
+            </div>
+        `;
+        
+        try {
+            // Parallel Orchestration
+            const [hResp, eResp] = await Promise.all([
+                fetch(`/planner/hotels?city=${city}`),
+                fetch(`/planner/events?city=${city}`)
+            ]);
+            
+            const hotels = await hResp.json();
+            const events = await eResp.json();
+            
+            discoveryCache.hotels = hotels;
+            discoveryCache.events = events;
+            discoveryCache.lastCity = city;
+
+            await new Promise(r => setTimeout(r, 400));
+            populateDiscoveryUI(hotels, events);
+            
+        } catch(e) { 
+            timeline.innerHTML = `<div class="error-state">Lyra Intelligence fallback: Connectivity interrupted. <button class="action-pill" onclick="renderDiscovery()">Retry Sync</button></div>`;
+        }
+    }
+
+    function populateDiscoveryUI(hotels, events) {
+        document.getElementById('hotel-grid').innerHTML = hotels.map(h => `
+            <div class="discovery-card" style="animation: fadeIn 0.4s ease forwards;">
+                <div class="discovery-card-img"><i class="fa-solid ${h.img}" style="font-size:1.8rem; color:rgba(255,255,255,0.1);"></i></div>
+                <div class="discovery-card-info">
+                    <div class="title">${h.name}</div>
+                    <div class="meta"><span>${h.rating}</span><span class="price">Est. ₹${h.price}</span></div>
+                </div>
+            </div>
+        `).join('');
+
+        document.getElementById('event-grid').innerHTML = events.map(e => `
+            <div class="discovery-card" style="animation: fadeIn 0.4s ease forwards;">
+                <div class="discovery-card-info">
+                    <div style="font-size:0.65rem; color:var(--accent-purple); font-weight:700; margin-bottom:5px;">${e.type.toUpperCase()}</div>
+                    <div class="title">${e.title}</div>
+                    <div class="meta"><span>${e.time}</span><span class="price">Est. ₹${e.cost}</span></div>
+                </div>
+            </div>
+        `).join('');
+    }
+
+    function toggleTask(idx) {
+        plannerTasks[idx].status = plannerTasks[idx].status === 'done' ? 'pending' : 'done';
+        renderPlanner();
+        savePlannerToServer();
+    }
+
+    async function savePlannerToServer() {
+        await fetch('/planner/save', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({ tasks: plannerTasks })
+        });
+    }
+
+    function applyTripTemplate(type) {
+        const templates = {
+            'weekend': 'Plan a budget 2-day trip to Goa including beach and night market',
+            'solo': 'Plan a 3-day solo spiritual journey to Rishikesh including yoga and rafting'
+        };
+        document.getElementById('planner-goal-input').value = templates[type];
+        generateTripPlan();
+    }
+
+    // Initialize planner when window loads
+    setTimeout(initPlanner, 1000);
+
+    // ---------------------------------
+    // FINANCE APPLICATION LOGIC
+    // ---------------------------------
+    let financeData = { watchlist: [], portfolio: {} };
+    let financeChart = null;
+
+    async function initFinance() {
+        try {
+            const resp = await fetch('/finance/data');
+            financeData = await resp.json();
+            renderWatchlist();
+            // Load first stock by default
+            if(financeData.watchlist.length > 0) selectStock(financeData.watchlist[0]);
+        } catch (e) { console.error("Finance Init Failed", e); }
+    }
+
+    async function searchStock() {
+        const input = document.getElementById('stock-search-input');
+        const symbol = input.value.trim().toUpperCase();
+        if(!symbol) return;
+        
+        if(!financeData.watchlist.includes(symbol)) {
+            financeData.watchlist.push(symbol);
+            renderWatchlist();
+            saveFinanceToServer();
+        }
+        selectStock(symbol);
+        input.value = '';
+    }
+
+    function renderFinance() {
+        // Sync with OS Global State
+        const budget = lyraOS.state.active_budget;
+        const planned = lyraOS.state.planned_expenses;
+        const remaining = budget - planned;
+        
+        const investEl = document.getElementById('port-invested');
+        const valueEl = document.getElementById('port-value');
+        
+        if (investEl) investEl.innerText = `₹${budget.toLocaleString()}`;
+        if (valueEl) {
+            valueEl.innerText = `₹${remaining.toLocaleString()}`;
+            valueEl.style.color = remaining < 10000 ? '#ef4444' : '#4ade80';
+        }
+    }
+
+    async function selectStock(symbol) {
+        showToast(`Syncing Market Data: ${symbol}...`);
+        const resp = await fetch(`/stock/${symbol}`);
+        const data = await resp.json();
+        
+        // Feed into OS Sentiment
+        lyraOS.update({ market_sentiment: data.change > 0 ? "Bullish" : "Bearish" });
+        
+        updateFinanceBoard(data);
+        getFinanceAI(data);
+    }
+
+    function updateFinanceBoard(data) {
+        document.getElementById('active-symbol').innerText = data.symbol;
+        const priceRow = document.getElementById('active-price-row');
+        priceRow.innerHTML = `$${data.price} <span class="change ${data.change >= 0 ? 'up' : 'down'}" style="font-size:1rem; margin-left:10px;">${data.change >= 0 ? '+' : ''}${data.change}%</span>`;
+        
+        document.getElementById('stat-cap').innerText = `$${(Math.random() * 3 + 0.5).toFixed(1)}T`;
+        
+        renderFinanceChart(data.history, data.change >= 0);
+    }
+
+    function renderFinanceChart(history, isBullish) {
+        const ctx = document.getElementById('financeChart').getContext('2d');
+        if(financeChart) financeChart.destroy();
+
+        const color = isBullish ? '#4ade80' : '#ef4444';
+        
+        financeChart = new Chart(ctx, {
+            type: 'line',
+            data: {
+                labels: ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'],
+                datasets: [{
+                    label: 'Price Evolution',
+                    data: history,
+                    borderColor: color,
+                    backgroundColor: 'rgba(139, 92, 246, 0.1)',
+                    borderWidth: 3,
+                    pointRadius: 4,
+                    pointBackgroundColor: color,
+                    tension: 0.4,
+                    fill: true
+                }]
+            },
+            options: {
+                responsive: true,
+                maintainAspectRatio: false,
+                plugins: { legend: { display: false } },
+                scales: {
+                    x: { grid: { display: false }, ticks: { color: '#64748b' } },
+                    y: { grid: { color: 'rgba(255,255,255,0.05)' }, ticks: { color: '#64748b' } }
+                }
+            }
+        });
+    }
+
+    async function getFinanceAI(stockData) {
+        const output = document.getElementById('finance-ai-output');
+        output.innerHTML = '<div class="thinking-state"><i class="fa-solid fa-brain fa-fade"></i> AI Market Sentiment Analysis...</div>';
+        
+        try {
+            const resp = await fetch('/finance/ai', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({
+                    stock: stockData.symbol,
+                    price: stockData.price,
+                    trend: stockData.change >= 0 ? 'Upward / Bullish' : 'Downward / Bearish'
+                })
+            });
+            const data = await resp.json();
+            output.innerHTML = marked.parse(data.analysis);
+        } catch (e) {
+            output.innerHTML = "Sentiment synthesis failed. Market link unstable.";
+        }
+    }
+
+    async function renderWatchlist() {
+        const list = document.getElementById('finance-watchlist');
+        list.innerHTML = '';
+        
+        for(let sym of financeData.watchlist) {
+            const resp = await fetch(`/stock/${sym}`);
+            const data = await resp.json();
+            
+            const item = document.createElement('div');
+            item.className = 'watch-item';
+            item.onclick = () => selectStock(sym);
+            item.innerHTML = `
+                <div class="symbol-box">
+                    <div class="symbol">${data.symbol}</div>
+                    <div class="name">${data.name}</div>
+                </div>
+                <div class="price-box">
+                    <div class="price">$${data.price}</div>
+                    <div class="change ${data.change >= 0 ? 'up' : 'down'}">${data.change >= 0 ? '+' : ''}${data.change}%</div>
+                </div>
+            `;
+            list.appendChild(item);
+        }
+    }
+
+    async function saveFinanceToServer() {
+        await fetch('/finance/save', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify(financeData)
+        });
+    }
+
+    // ---------------------------------
+    // LYRA OS BOOT SEQUENCE
+    // ---------------------------------
+    window.addEventListener('DOMContentLoaded', () => {
+        console.log("Lyra OS: Initiating System Boot...");
+        lyraOS.sync();
+        initChatSystem();
+        initPlanner();
+        // Finance init happens after tiny delay to ensure heavy Charts are ready
+        setTimeout(initFinance, 500);
+    });
+
+</script>
+</body>
+</html>
+"""
+
+# --------------------------
+# LYRA AI BACKEND ARCHITECTURE
+# --------------------------
+
+@app.route('/update_memory', methods=['POST'])
+def update_memory():
+    data = request.get_json()
+    memory["user_context"] = data.get("user_context", "")
+    save_persistent_memory(memory)
+    return jsonify({"status": "ok"})
+
+# --------------------------
+# LYRA AI BACKEND ARCHITECTURE
+# --------------------------
+
+UNIVERSAL_STYLING = """
+[OUTPUT PROTOCOL: MANDATORY STRUCTURE]
+1. SUMMARY: A 1-sentence synthesis of the answer.
+2. DETAILS: Structured analysis (use bullet points, maximum 5).
+3. FINAL CONCLUSION: The definitive resolution or calculation.
+
+Rules: 
+- Zero conversational fluff (No "Sure", "I'd be happy to").
+- Use Bold for key terms.
+- Use Code Blocks for math/logic.
+"""
+
+def get_mode_prompt(mode, is_voice):
+    base = UNIVERSAL_STYLING
+    if mode == "builder": base += "\nMode: SENIOR ARCHITECT. Prioritize implementation steps and code integrity."
+    elif mode == "student": base += "\nMode: LOGICAL INSTRUCTOR. Prioritize analogies and first-principles explanation."
+    elif mode == "idea": base += "\nMode: CREATIVE STRATEGIST. Prioritize variety, blue-sky thinking, and feasibility."
+    
+    # VOICE INTELLIGENCE OVERRIDE
+    if is_voice:
+        base = "Respond in short, natural spoken sentences. Keep it conversational. Max 2 sentences."
+    return base
+
+def score_response(query, response):
+    if not response: return 0.0
+    query_words = set(query.lower().split())
+    resp_words = set(response.lower().split())
+    overlap = len(query_words.intersection(resp_words)) / max(1, len(query_words))
+    relevance = min(1.0, overlap * 2) 
+    clarity = 0.5
+    if '\n' in response or '-' in response or '*' in response: clarity += 0.3
+    return min(1.0, (relevance + clarity) / 2.0)
+
+# --------------------------
+# AI INTELLIGENCE ORCHESTRATOR
+# --------------------------
+def detect_os_intent(query):
+    """Categorizes intent for smart tool routing."""
+    q = query.lower()
+    if any(k in q for k in ["code", "script", "function", "python", "javascript", "html", "css", "program", "debug"]): return "CODING"
+    if any(k in q for k in ["plan", "schedule", "task", "calendar", "day", "todo", "appointment", "arrange"]): return "PLANNER"
+    if any(k in q for k in ["stock", "price", "market", "finance", "invest", "buy", "sell", "dividend", "crypto"]): return "FINANCE"
+    if any(k in q for k in ["calculate", "math", "equation", "solve", "multiply", "divide", "plus", "minus", "root", "sin", "cos"]): return "CALCULATOR"
+    if any(k in q for k in ["search", "find", "who is", "latest", "news", "google", "current"]): return "SEARCH"
+    return "CHITCHAT"
+
+def fast_orchestrator(message, history, mode_prompt):
+    """Refined multi-model routing & fallback system."""
+    # Step 1: Detect intent and perform potential Search
+    intent = detect_os_intent(message)
+    
+    # SYSTEM STATE INJECTION
+    os_context = f"\n[LYRA OS STATE]: Budget ₹{GLOBAL_OS_STATE['active_budget']} | Planned ₹{GLOBAL_OS_STATE['planned_expenses']} | Market: {GLOBAL_OS_STATE['market_sentiment']}"
+    if GLOBAL_OS_STATE["current_trip"]["destination"]:
+        os_context += f" | Next Trip: {GLOBAL_OS_STATE['current_trip']['destination']} ({GLOBAL_OS_STATE['current_trip']['distance_km']}km)"
+    
+    mode_prompt += os_context
+    
+    if intent == "SEARCH":
+        sd = serp_search(message)
+        if sd: message = f"Realtime Web Intelligence (High Priority):\n{sd}\n\nQ: {message}"
+        
+    intent_instruct = f"\n[INTENT DETECTED]: {intent}. Optimize output for {intent.lower()} logic."
+    mode_prompt += intent_instruct
+    
+    # Step 2: Inject Memory Awareness
+    recent_context = retrieve_relevant_context(message, limit=2)
+    if recent_context:
+        mode_prompt += f"\n[RELEVANT MEMORY]: {' '.join(recent_context)}"
+
+    style = memory["config"].get("response_style", "smart")
+    
+    # Model Map
+    logical_models = [groq_call, cerebras_call, sambanova_call]
+    creative_models = [mistral_call, together_call, gemini_call]
+    fast_models = [cerebras_call, huggingface_call]
+
+    # Step 3: Execution Strategy
+    try:
+        if style == "fast":
+            # Priority: Speed
+            return cerebras_call(message, history, mode_prompt)
+        elif style == "creative":
+            # Priority: Personality & Idea Generation
+            return mistral_call(message, history, mode_prompt)
+        else:
+            # SMART MODE: Parallel Synthesis
+            with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
+                # Query logic models in parallel for best answer
+                futures = {executor.submit(m, message, history, mode_prompt): m.__name__ for m in logical_models[:2]}
+                for future in concurrent.futures.as_completed(futures, timeout=8.0):
+                    result = future.result()
+                    if result and len(result) > 5: return result
+    except Exception as e:
+        print(f"Orchestration Error: {e}. Executing Fallback Layer...")
+    
+    # Universal Fallback Layer
+    for model_fn in [gemini_call, together_call, sambanova_call]:
+        try:
+            res = model_fn(message, history, mode_prompt)
+            if res: return res
+        except: continue
+        
+    return "The Lyra intelligence node is currently experiencing heavy architectural load. Please re-synchronize your query."
+
+def construct_payload(message, history, mode_prompt):
+    base_sys = f"{SYSTEM_PROMPT}\n\n[USER SYSTEM INSTRUCTION]: {mode_prompt}"
+    return [{"role": "system", "content": base_sys}] + history + [{"role": "user", "content": message}]
+
+def groq_call(message, history=[], mode_prompt=""):
+    keys = [os.getenv(k).strip() for k in ["GROQ_API_KEY", "GROQ_API_KEY_2"] if os.getenv(k)]
+    url = "https://api.groq.com/openai/v1/chat/completions"
+    payload = {"model": "llama-3.3-70b-versatile", "messages": construct_payload(message, history, mode_prompt)}
+    for key in keys:
+        try:
+            resp = http_session.post(url, headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"}, json=payload, timeout=10)
+            resp.raise_for_status()
+            return resp.json()["choices"][0]["message"]["content"]
+        except: continue
+    raise Exception("Fail")
+
+def mistral_call(message, history=[], mode_prompt=""):
+    api_key = os.getenv("MISTRAL_API_KEY")
+    url = "https://api.mistral.ai/v1/chat/completions"
+    # Pixtral Large Update
+    payload = {"model": "pixtral-large-2411", "messages": construct_payload(message, history, mode_prompt)}
+    resp = requests.post(url, headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}, json=payload, timeout=10)
+    resp.raise_for_status()
+    return resp.json()["choices"][0]["message"]["content"]
+
+def gemini_call(message, history=[], mode_prompt=""):
+    api_key = os.getenv("GEMINI_API_KEY")
+    # Flash Lite Model Update
+    url = f"https://generativelanguage.googleapis.com/v1/models/gemini-2.0-flash-lite-preview-02-05:generateContent?key={api_key}"
+    contents = []
+    for msg in history: contents.append({"role": "user" if msg["role"]=="user" else "model", "parts": [{"text": msg["content"]}]})
+    contents.append({"role": "user", "parts": [{"text": message}]})
+    base_sys = f"{SYSTEM_PROMPT}\n\n[USER SYSTEM INSTRUCTION]: {mode_prompt}"
+    payload = {"system_instruction": {"parts": [{"text": base_sys}]}, "contents": contents}
+    resp = requests.post(url, headers={"Content-Type": "application/json"}, json=payload, timeout=10)
+    resp.raise_for_status()
+    return resp.json()["candidates"][0]["content"]["parts"][0]["text"]
+
+def openrouter_call(message, history=[], mode_prompt=""):
+    keys = [os.getenv(k).strip() for k in ["OPENROUTER_API_KEY", "OPENROUTER_API_KEY_2"] if os.getenv(k)]
+    url = "https://openrouter.ai/api/v1/chat/completions"
+    
+    # 5 Models Rotation
+    models = [
+        "google/gemma-3-27b-it:free",
+        "meta-llama/llama-3.3-70b-instruct:free",
+        "qwen/qwen3-coder:free",
+        "openai/gpt-oss-20b:free",
+        "nvidia/llama-nemotron-embed-vl-1b-v2:free"
+    ]
+    
+    for key in keys:
+        for model in models:
+            try:
+                payload = {"model": model, "messages": construct_payload(message, history, mode_prompt)}
+                resp = requests.post(url, headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"}, json=payload, timeout=10)
+                if resp.ok: return resp.json()["choices"][0]["message"]["content"]
+            except: continue
+    raise Exception("OpenRouter Nodes Exhausted")
+
+def sambanova_call(message, history=[], mode_prompt=""):
+    # SambaNova 6 Keys -> 6 Specific Models
+    sn_configs = [
+        {"key": os.getenv("SAMBANOVA_API_KEY"), "model": "Llama-4-Maverick-17B-128E-Instruct"},
+        {"key": os.getenv("SAMBANOVA_API_KEY_2"), "model": "gpt-oss-120b"},
+        {"key": os.getenv("SAMBANOVA_API_KEY_3"), "model": "DeepSeek-V3.1"},
+        {"key": os.getenv("SAMBANOVA_API_KEY_4"), "model": "gemma-3-12b-it"},
+        {"key": os.getenv("SAMBANOVA_API_KEY_5"), "model": "DeepSeek-V3.2"},
+        {"key": os.getenv("SAMBANOVA_API_KEY_6"), "model": "MiniMax-M2.5"}
+    ]
+    url = "https://api.sambanova.ai/v1/chat/completions"
+    for config in sn_configs:
+        if not config["key"]: continue
+        try:
+            payload = {"model": config["model"], "messages": construct_payload(message, history, mode_prompt)}
+            resp = requests.post(url, headers={"Authorization": f"Bearer {config['key']}", "Content-Type": "application/json"}, json=payload, timeout=12)
+            if resp.ok: return resp.json()["choices"][0]["message"]["content"]
+        except: continue
+    raise Exception("SambaNova Pipeline Failure")
+
+def together_call(message, history=[], mode_prompt=""):
+    api_key = os.getenv("TOGETHER_API_KEY")
+    url = "https://api.together.xyz/v1/chat/completions"
+    # 2 Models Rotation
+    models = ["meta-llama/Meta-Llama-3.1-70B-Instruct-Turbo", "google/gemma-2-27b-it"]
+    for model in models:
+        try:
+            payload = {"model": model, "messages": construct_payload(message, history, mode_prompt)}
+            resp = requests.post(url, headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}, json=payload, timeout=10)
+            if resp.ok: return resp.json()["choices"][0]["message"]["content"]
+        except: continue
+    raise Exception("Together Nodes Failure")
+
+def cerebras_call(message, history=[], mode_prompt=""):
+    api_key = os.getenv("CEREBRAS_API_KEY")
+    url = "https://api.cerebras.ai/v1/chat/completions"
+    payload = {"model": "qwen-3-235b-a22b-instruct-2507", "messages": construct_payload(message, history, mode_prompt)}
+    resp = requests.post(url, headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}, json=payload, timeout=10)
+    return resp.json()["choices"][0]["message"]["content"]
+
+def huggingface_call(message, history=[], mode_prompt=""):
+    api_key = os.getenv("HUGGINGFACE_API_KEY")
+    url = "https://api-inference.huggingface.co/models/mistralai/Mistral-7B-Instruct-v0.3/v1/chat/completions"
+    payload = {"model": "mistralai/Mistral-7B-Instruct-v0.3", "messages": construct_payload(message, history, mode_prompt), "max_tokens": 1024}
+    resp = requests.post(url, headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}, json=payload, timeout=10)
+    return resp.json()["choices"][0]["message"]["content"]
+
+# --------------------------
+# SEARCH & TOOLS SYSTEM
+# --------------------------
+def serp_search(query):
+    api_key = os.getenv("SERP_API_KEY")
+    if not api_key: return ddgs_search(query) # Fallback
+    
+    url = "https://serpapi.com/search"
+    params = { "q": query, "api_key": api_key, "num": 5 }
+    try:
+        resp = requests.get(url, params=params, timeout=10)
+        data = resp.json()
+        results = []
+        if "organic_results" in data:
+            for r in data["organic_results"]: results.append(f"{r.get('title')}: {r.get('snippet')}")
+        return "\n".join(results)
+    except: return ddgs_search(query)
+
+def ddgs_search(query):
+    try:
+        results = []
+        with DDGS() as ddgs:
+            for r in ddgs.text(query, max_results=5): results.append(r["body"])
+        return "\n".join(results)
+    except: return ""
+
+# --------------------------
+# FILE EXTRACTION SYSTEM
+# --------------------------
+def extract_text_from_file(file_data, file_name):
+    ext = file_name.split('.')[-1].lower()
+    if ext == 'txt':
+        return file_data.decode('utf-8', errors='ignore')
+    elif ext == 'pdf':
+        try:
+            import io
+            from PyPDF2 import PdfReader
+            pdf = PdfReader(io.BytesIO(file_data))
+            text = ""
+            for page in pdf.pages: text += page.extract_text()
+            return text
+        except: return "[System: PDF Library Missing or File Corrupt]"
+    elif ext in ['jpg', 'jpeg', 'png']:
+        return f"[System: Image Attachment: {file_name} - Vision Analysis Required (Base64 Context Provided)]"
+    return "[System: Unsupported File Format]"
+
+# --------------------------
+# IMAGE MODALITY SYSTEM
+# --------------------------
+IMAGE_CACHE = {}
+
+def is_image_request(message):
+    triggers = ["generate image", "create image", "draw ", "image of", "make a picture", "generate a picture", "create a picture"]
+    if message.startswith("[SYSTEM:"): return True
+    return any(t in message.lower() for t in triggers)
+
+def optimize_image_prompt(message, quality="standard"):
+    sys_prompt = "You are a prompt engineer for stable diffusion. Convert this simple input into a high-quality, highly detailed image generation prompt. Add descriptors like 'cinematic lighting, 4k, ultra detailed, sharp focus, masterpiece'. Return ONLY the prompt string, no quotes."
+    try: 
+        p = mistral_call(message, [], sys_prompt)
+        if quality == "hd": p += " -- Massive detail override, 8k resolution, photorealistic masterpiece level quality."
+        return p
+    except: 
+        p = f"{message}, high quality, detailed, masterpiece, cinematic lighting, 4k, sharp focus"
+        if quality == "hd": p += ", 8k, hyper-detailed"
+        return p
+
+import base64
+import uuid
+import concurrent.futures
+
+def edit_image(img_id, prompt, instruction, quality="standard"):
+    sys = f"You are a prompt editor. Rewrite this image prompt: '{prompt}' to explicitly follow this edit instruction: '{instruction}'. Keep it highly detailed. Return ONLY the new prompt string."
+    try: new_prompt = mistral_call(sys, [], "You are a prompt engineer.")
+    except: new_prompt = f"{prompt}, {instruction}"
+    
+    return generate_image(new_prompt, quality)
+
+def generate_variations(img_id, prompt, quality="standard"):
+    # SD3 doesn't easily support simple variations without strict payload params, 
+    # we simulate powerful iterations via threading multiple distinct generation calls
+    def gen(_): return generate_image(prompt + f", highly creative alternative variant", quality)
+    res = []
+    with concurrent.futures.ThreadPoolExecutor() as executor:
+        futures = [executor.submit(gen, i) for i in range(2)]
+        for f in concurrent.futures.as_completed(futures):
+            rtn = f.result()
+            if "image" in rtn: res.append(rtn["image"])
+    
+    if len(res) > 0: return {"images": res, "prompt": prompt}
+    return {"error": "Couldn't generate variations."}
+
+def generate_image(prompt, quality="standard"):
+    api_key = os.getenv("NVIDIA_API_KEY")
+    if not api_key: return {"error": "NVIDIA_API_KEY missing."}
+    target_prompt = optimize_image_prompt(prompt, quality)
+    # NVIDIA Screenshot Update: Stable Diffusion 3 Medium
+    configs = [
+        {"url": "https://ai.api.nvidia.com/v1/genai/stabilityai/stable-diffusion-3-medium", "type": "genai"},
+        {"url": "https://ai.api.nvidia.com/v1/images/generations", "type": "openai", "model": "stabilityai/sd3-medium"},
+        {"url": "https://ai.api.nvidia.com/v1/genai/stabilityai/sdxl", "type": "genai"}
+    ]
+    
+    headers = { "Authorization": f"Bearer {api_key}", "Content-Type": "application/json", "Accept": "application/json" }
+    
+    last_err = ""
+    for cfg in configs:
+        url = cfg["url"]
+        try:
+            print(f"DEBUG [Nvidia]: Trying {cfg['type']} node: {url}")
+            
+            if cfg["type"] == "openai":
+                payload = {
+                    "model": cfg["model"],
+                    "prompt": target_prompt,
+                    "n": 1,
+                    "size": "1024x1024",
+                    "response_format": "b64_json"
+                }
+            else:
+                payload = { "prompt": target_prompt, "width": 1024, "height": 1024 }
+            
+            resp = requests.post(url, headers=headers, json=payload, timeout=20)
+            if not resp.ok: 
+                last_err = f"{resp.status_code}: {resp.text}"
+                continue
+                
+            data = resp.json()
+            img_str = None
+            
+            if cfg["type"] == "openai":
+                img_str = data["data"][0]["b64_json"]
+            else:
+                if "image" in data: img_str = data['image']
+                elif "artifacts" in data and len(data["artifacts"]) > 0: img_str = data["artifacts"][0]["base64"]
+            
+            if img_str:
+                img_id = str(uuid.uuid4())
+                IMAGE_CACHE[img_id] = img_str
+                print(f"DEBUG [Nvidia]: SUCCESS via {url}")
+                return {"image": f"data:image/png;base64,{img_str}", "prompt": target_prompt, "img_id": img_id}
+                
+        except Exception as e:
+            last_err = str(e)
+            continue
+
+    print(f"ERROR [Nvidia]: Multi-protocol failure. Final trace: {last_err}")
+    
+    # --------------------------
+    # EMERGENCY FALLBACK: HUGGING FACE
+    # --------------------------
+    print("WARNING [Image]: NVIDIA Nodes exhausted. Switching to Hugging Face Fallback...")
+    hf_key = os.getenv("HUGGINGFACE_API_KEY")
+    if hf_key:
+        try:
+            hf_url = "https://api-inference.huggingface.co/models/stabilityai/stable-diffusion-xl-base-1.0"
+            hf_headers = {"Authorization": f"Bearer {hf_key}"}
+            hf_payload = {"inputs": target_prompt}
+            
+            hf_resp = requests.post(hf_url, headers=hf_headers, json=hf_payload, timeout=40)
+            if hf_resp.ok:
+                img_data = base64.b64encode(hf_resp.content).decode('utf-8')
+                img_id = str(uuid.uuid4())
+                IMAGE_CACHE[img_id] = img_data
+                print("DEBUG [Image]: SUCCESS via Hugging Face Fallback.")
+                return {"image": f"data:image/png;base64,{img_data}", "prompt": target_prompt, "img_id": img_id}
+        except Exception as e:
+            print(f"ERROR [Image]: Fallback failed: {e}")
+
+    return {"error": "All visual generation nodes (NVIDIA & HuggingFace) are currently offline. Please try again in 5 minutes."}
+
+# --------------------------
+# FLASK ROUTING
+# --------------------------
+
+@app.route('/favicon.<ext>')
+def serve_favicon(ext):
+    for f in ['favicon.png', 'favicon.jpg']:
+        if os.path.exists(os.path.join(app.root_path, f)): return send_file(os.path.join(app.root_path, f))
+    return "Not Found", 404
+
+@app.route('/')
+def home():
+    return render_template_string(HTML_TEMPLATE)
+
+@app.route('/upload_image', methods=['POST'])
+def upload_image_standalone():
+    if 'image' not in request.files: return jsonify({"error": "No image part"}), 400
+    f = request.files['image']
+    if f.filename == '': return jsonify({"error": "No filename"}), 400
+    
+    try:
+        file_data = f.read()
+        if len(file_data) > 8*1024*1024: return jsonify({"error": "File too large (>8MB)"}), 400
+        
+        job_id = str(uuid.uuid4())
+        VISION_JOBS[job_id] = {"status": "analyzing", "filename": f.filename}
+        session_id = request.headers.get('X-Session-ID', 'default')
+
+        def run_vision_pipeline():
+            # STAGE 1: Extract Structured Metadata
+            metadata = analyze_image(file_data, f.filename)
+            VISION_JOBS[job_id]["status"] = "synthesizing"
+            
+            # STAGE 2: Deep Reasoning Logic
+            reasoning = reason_about_image(metadata, "Explain what this image is and its significance.", "Vision Mode")
+            
+            # STORE FOR FOLLOW-UPS
+            if session_id not in memory: memory[session_id] = []
+            if "vision_context" not in memory: memory["vision_context"] = {}
+            memory["vision_context"][session_id] = metadata
+
+            VISION_JOBS[job_id] = {
+                "status": "complete", 
+                "result": reasoning, 
+                "metadata": metadata, 
+                "filename": f.filename
+            }
+            ingest_file_rag(file_data, f.filename)
+
+        threading.Thread(target=run_vision_pipeline, daemon=True).start()
+        return jsonify({"job_id": job_id, "filename": f.filename})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/vision_status/<job_id>')
+def vision_status(job_id):
+    job = VISION_JOBS.get(job_id)
+    if not job: return jsonify({"error": "Job not found"}), 404
+    return jsonify(job)
+
+# --------------------------
+# EVOLUTION ROUTES
+# --------------------------
+@app.route('/evolution/proposals')
+def get_proposals():
+    return jsonify({"proposals": memory.get("proposals", [])})
+
+@app.route('/evolution/analyze', methods=['POST'])
+def trigger_analysis():
+    analyze_self()
+    return jsonify({"status": "analyzing", "proposals": memory.get("proposals", [])})
+
+@app.route('/evolution/approve', methods=['POST'])
+def approve_proposal():
+    data = request.get_json()
+    action = data.get('action')
+    value = data.get('value')
+    index = data.get('index')
+    
+    if apply_change(action, value):
+        proposals = memory.get("proposals", [])
+        if 0 <= index < len(proposals):
+            proposals.pop(index)
+            memory["proposals"] = proposals
+            save_persistent_memory(memory)
+        return jsonify({"status": "success"})
+    return jsonify({"status": "error"}), 500
+
+# --------------------------
+# UTILITY ORCHESTRATOR
+# --------------------------
+def run_utility_orchestrator(message):
+    u_type = "GENERAL"
+    if "[UTIL: CALCULATOR]" in message: u_type = "CALCULATOR"
+    elif "[UTIL: MAPS]" in message: u_type = "MAPS"
+    elif "[UTIL: FINANCE]" in message: u_type = "FINANCE"
+    elif "[UTIL: PLANNER]" in message: u_type = "PLANNER"
+    
+    clean_msg = message.replace(f"[UTIL: {u_type}]", "").strip()
+    
+    if u_type == "CALCULATOR":
+        # Simple Math Bypass (Zero AI Latency)
+        if re.match(r'^[0-9+\-*/().% ]+$', clean_msg):
+            res = safe_eval(clean_msg)
+            if res is not None:
+                return f"**Answer**: {res}\n\n**Mechanism**: Native Precision Solver"
+        
+        # Complex/Word Problem Logic
+        return ai_math_solvent(clean_msg)
+    elif u_type == "MAPS":
+        sd = serp_search(f"location data and maps for: {clean_msg}")
+        sys = "You are a Geospatial Intelligence Engine. Describe locations, travel times, and map data based on the provided search results."
+        return fast_orchestrator(f"SEARCH DATA: {sd}\n\nUSER: {clean_msg}", [], sys)
+    elif u_type == "FINANCE":
+        sd = serp_search(f"stock price and market news: {clean_msg}")
+        sys = "You are a Financial Quantitative Analyst. Provide market insights, stock prices, and financial analysis."
+        return fast_orchestrator(f"MARKET DATA: {sd}\n\nUSER: {clean_msg}", [], sys)
+    elif u_type == "PLANNER":
+        return run_agent_swarm(clean_msg)
+    return "[System: Utility Misfire]"
+
+# --------------------------
+# UNIFIED INTELLIGENCE SYSTEM
+# --------------------------
+
+def get_unified_os_context():
+    """Synthesizes data from across all Lyra apps into a unified cognitive bank."""
+    try:
+        # 1. Planner Logic
+        planner_data = load_planner_data()
+        all_tasks = planner_data.get('tasks', []) if isinstance(planner_data, dict) else []
+        today_tasks = [t['task'] for t in all_tasks if isinstance(t, dict) and t.get('status') == 'pending']
+        
+        # 2. Finance Logic
+        finance_data = load_finance_data()
+        watchlist = finance_data.get('watchlist', [])
+        invested = finance_data.get('portfolio', {}).get('invested', 0)
+        
+        # 3. User Context
+        user_context = memory.get("user_context", "No specific habits stored.")
+
+        os_context = f"""
+        [LYRA OS CURRENT INTELLIGENCE STATE]
+        
+        - ACTIVE TASKS: {', '.join(today_tasks[:5]) if today_tasks else 'No pending tasks.'}
+        - MARKET WATCHLIST: {', '.join(watchlist[:5]) if watchlist else 'No active stocks.'}
+        - PORTFOLIO CAPITAL: ${invested}
+        - KNOWN USER HABITS: {user_context}
+        
+        [SYSTEM CAPABILITIES]
+        - You can modify the Planner if user asks to schedule something.
+        - You can perform Financial analysis for any stock in the watchlist.
+        - You can use the Calculator engine for complex math.
+        """
+        return os_context
+    except Exception as e:
+        print(f"OS Context Sync Error: {e}")
+        return "[SYSTEM: Cross-App Sync Interrupted]"
+
+def detect_os_intent(query):
+    """Routes queries to specific OS tools if intent is detected."""
+    query = query.lower()
+    if any(w in query for w in ["plan", "schedule", "task", "calendar", "day", "todo"]):
+        return "PLANNER"
+    if any(w in query for w in ["stock", "price", "market", "finance", "invest", "buy", "sell"]):
+        return "FINANCE"
+    if any(w in query for w in ["calculate", "math", "equation", "solve", "plus", "minus"]):
+        return "CALCULATOR"
+    return "GENERAL"
+def upload_file():
+    if 'file' not in request.files: return jsonify({"error": "No file part"}), 400
+    f = request.files['file']
+    if f.filename == '': return jsonify({"error": "No selected file"}), 400
+    
+    # Check max images/files if needed
+    file_data = f.read()
+    
+    # INGEST INTO MULTIMODAL RAG PIPELINE
+    threading.Thread(target=ingest_file_rag, args=(file_data, f.filename), daemon=True).start()
+    return jsonify({"filename": f.filename, "status": "indexed", "info": f"{f.filename} is now part of my semantic knowledge base."})
+
+@app.route('/restore_session', methods=['POST'])
+def restore_session():
+    data = request.get_json()
+    sid = data.get('session_id')
+    history = data.get('history', [])
+    if sid:
+        memory[sid] = history
+        return jsonify({"status": "restablished"})
+    return jsonify({"status": "failed"}), 400
+
+@app.route('/chat_stream', methods=['POST'])
+def chat_stream():
+    data = request.get_json()
+    raw_message = data.get('message', '')
+    provider = data.get('provider', 'smart').lower()
+    mode = data.get('mode', 'builder').lower()
+    is_voice = data.get('is_voice', False)
+    image_quality = data.get('image_quality', 'standard')
+    session_id = data.get('session_id')
+    
+    if not session_id or session_id not in memory:
+        session_id = str(uuid.uuid4())
+        memory[session_id] = []
+        
+    history = memory.get(session_id, [])[-10:]
+    
+    # RAG & PERSISTENT MEMORY INJECTION
+    user_prefs = memory.get("user_context", "")
+    semantic_history = retrieve_relevant_context(raw_message, "semantic_bank", limit=2)
+    document_context = retrieve_relevant_context(raw_message, "document_store", limit=4, threshold=0.7)
+    
+    hist_str = "\n".join([f"- {m}" for m in semantic_history])
+    doc_str = "\n".join([f"- {m}" for m in document_context])
+    
+    # UNIFIED OS CONTEXT INJECTION
+    os_intelligence = get_unified_os_context()
+    
+    rag_feedback = ""
+    if document_context:
+        is_visual = any("[IMAGE SOURCE]" in m for m in document_context)
+        rag_feedback = "[SOURCE: INFRASTRUCTURE DOCUMENTS DETECTED]"
+        if is_visual: rag_feedback = "[SOURCE: VISUAL DATA & DOCUMENTS DETECTED. Mention 'Based on the provided images' if applicable.]"
+
+    mode_prompt = f"{get_mode_prompt(mode, is_voice)}\n{rag_feedback}\n\n{os_intelligence}\n\n[USER PERSONALITY]: {user_prefs}\n\n[PAST CONVERSATION CONTEXT]:\n{hist_str}\n\n[DOCUMENTS & IMAGES CONTEXT]:\n{doc_str}"
+    
+    # MULTIMODAL VISION CONTEXT INJECTION (Multi-turn Support)
+    vision_context = memory.get("vision_context", {}).get(session_id, "")
+    if vision_context and any(w in raw_message.lower() for w in ["it", "this image", "image", "what is", "happening", "describe", "explain"]):
+        final_text = reason_about_image(vision_context, raw_message, mode_prompt)
+        provider_name = "Lyra Vision Reasoning"
+    elif is_image_request(raw_message):
+        
+        # Parse Specific Action Protocols
+        if raw_message.startswith("[SYSTEM: VARIATION]"):
+            parts = raw_message.split(" | PRMPT:")
+            img_id = parts[0].replace("[SYSTEM: VARIATION] ID:", "").strip()
+            prompt = parts[1].strip() if len(parts) > 1 else ""
+            img_res = generate_variations(img_id, prompt, image_quality)
+            if "error" in img_res: return jsonify({"type": "error", "data": img_res["error"]})
+            memory[session_id].append({"role": "user", "content": "Create variations of the image."})
+            memory[session_id].append({"role": "assistant", "content": f"[GENERATED IMAGE GRID]"})
+            return jsonify({"type": "image_grid", "data": img_res["images"], "prompt": img_res["prompt"]})
+            
+        elif raw_message.startswith("[SYSTEM: EDIT]"):
+            parts = raw_message.split(" | PRMPT:")
+            p2 = parts[1].split(" | INST:") if len(parts) > 1 else ["",""]
+            img_id = parts[0].replace("[SYSTEM: EDIT] ID:", "").strip()
+            prompt = p2[0].strip()
+            instruction = p2[1].strip() if len(p2) > 1 else ""
+            img_res = edit_image(img_id, prompt, instruction, image_quality)
+            
+        elif raw_message.startswith("[SYSTEM: STYLE]"):
+            parts = raw_message.split(" | PRMPT:")
+            p2 = parts[1].split(" | STY:") if len(parts) > 1 else ["",""]
+            img_id = parts[0].replace("[SYSTEM: STYLE] ID:", "").strip()
+            prompt = p2[0].strip()
+            style = p2[1].strip() if len(p2) > 1 else ""
+            img_res = generate_image(prompt + f", painted in a strict highly detailed {style} style art direction", image_quality)
+            
+        else:
+            img_res = generate_image(raw_message, image_quality)
+            
+        if "error" in img_res: 
+            return jsonify({"type": "error", "data": img_res["error"]})
+        
+        memory[session_id].append({"role": "user", "content": raw_message})
+        memory[session_id].append({"role": "assistant", "content": f"[GENERATED IMAGE: {img_res['prompt']}]"})
+        return jsonify({"type": "image", "data": img_res["image"], "prompt": img_res["prompt"], "img_id": img_res["img_id"]})
+
+    cache_key = f"{provider}_{mode}_{is_voice}_{raw_message}"
+    if cache_key in query_cache:
+        def stream_cached():
+            for word in query_cache[cache_key].split(" "):
+                yield word + " "
+                time.sleep(0.01) 
+        return Response(stream_with_context(stream_cached()), mimetype='text/plain')
+
+    try:
+        wf_instruction = get_workflow_instruction(raw_message)
+        if wf_instruction: mode_prompt = f"{mode_prompt}\n\n[WORKFLOW OVERRIDE]: {wf_instruction}"
+
+        if "[UTIL:" in raw_message:
+            final_text = run_utility_orchestrator(raw_message)
+            provider_name = "Lyra Utility Engine 🛰️"
+        elif len(raw_message.split()) < 4 and provider not in ["orchestrator", "smart"]: final_text = mistral_call(raw_message, history, mode_prompt)
+        elif provider == "smart":
+            # Smart Reasoning + Multimodal Context
+            final_text = fast_orchestrator(raw_message, history, mode_prompt)
+            provider_name = "Lyra Smart Core 🧠"
+        elif provider == "orchestrator":
+            # Pure Speed Mode
+            final_text = fast_orchestrator(raw_message, history, mode_prompt)
+            provider_name = "Lyra Speed Fabric ⚡"
+        else:
+            # Direct Provider Call with Fallback
+            provider_funcs = {
+                "groq": groq_call, 
+                "mistral": mistral_call,
+                "gemini": gemini_call, 
+                "sambanova": sambanova_call,
+                "together": together_call,
+                "cerebras": cerebras_call
+            }
+            func = provider_funcs.get(provider, fast_orchestrator)
+            try:
+                final_text = func(raw_message, history, mode_prompt)
+            except:
+                final_text = fast_orchestrator(raw_message, history, mode_prompt)
+            provider_name = f"Node: {provider.capitalize()}"
+
+        # CACHE FINAL RESULT
+        query_cache[cache_key] = final_text
+        if len(query_cache) > 200: query_cache.pop(next(iter(query_cache))) 
+        
+        # PERSIST SEMANTICALLY
+        add_to_semantic_memory(f"Query: {raw_message} | Logic: {final_text[:200]}")
+        memory["chat_count"] = memory.get("chat_count", 0) + 1
+        if memory["chat_count"] % 15 == 0:
+            threading.Thread(target=analyze_self, daemon=True).start()
+            
+        if session_id not in memory: memory[session_id] = []
+        memory[session_id].append({"role": "user", "content": raw_message})
+        memory[session_id].append({"role": "assistant", "content": final_text})
+        save_persistent_memory(memory)
+        
+        format_text = final_text
+
+        def generate():
+            # STREAMING ENGINE: Improved logic for "sentient" flow
+            words = format_text.split(" ")
+            for i in range(0, len(words)):
+                chunk = words[i] + " "
+                yield chunk
+                if len(chunk) > 10: time.sleep(0.015)
+                else: time.sleep(0.008)
+                
+        return Response(stream_with_context(generate()), mimetype='text/plain')
+
+    except Exception as e:
+        print(f"API Error Caught: {e}")
+        def generate_err():
+            err_msg = "⚠ Something failed structurally. Generating fallback metrics."
+            for chunk in err_msg.split(" "):
+                yield chunk + " "
+                time.sleep(0.01)
+        return Response(stream_with_context(generate_err()), mimetype='text/plain')
+
+@app.route('/feedback', methods=['POST'])
+def save_feedback():
+    data = request.get_json()
+    msg_id = data.get('id')
+    vote = data.get('vote') # 1 for up, -1 for down
+    add_to_semantic_memory(f"[SYSTEM FEEDBACK]: User gave {vote} to message {msg_id}. Adjust future reasoning patterns accordingly.")
+    return jsonify({"status": "captured"})
+
+def get_workflow_instruction(message):
+    if "[WORKFLOW: IDEA]" in message:
+        return "Act as an Expert Visionary. Generate 3 distinct concept directions. For each, provide: 1. Core Value 2. Market Strategy 3. Key Obstacle."
+    if "[WORKFLOW: CONTENT]" in message:
+        return "Act as a Pro Content Architect. Create a high-converting draft. Include relevant SEO keywords, a hook, and a clear call to action."
+    if "[WORKFLOW: BUILDER]" in message:
+        return "Act as a Senior Software Engineer. Provide clean, modular code with comments. Explain your logic step-by-step and mention potential edge cases."
+    if "[ITERATE: IMPROVE]" in message:
+        return "Take the previous output and improve the professional quality, clarity, and depth. Make it elite."
+    if "[ITERATE: SIMPLIFY]" in message:
+        return "Make the previous output shorter and easier to understand for a 5th grader. Remove jargon."
+    if "[ITERATE: MORE CREATIVE]" in message:
+        return "Inject more personality, unique analogies, and creative flair into the previous response."
+    return ""
+
+PLANNER_DATA_FILE = "planner.json"
+
+def load_planner_data():
+    if not os.path.exists(PLANNER_DATA_FILE): return {"tasks": [], "history": []}
+    try:
+        with open(PLANNER_DATA_FILE, "r") as f: return json.load(f)
+    except: return {"tasks": [], "history": []}
+
+def save_planner_data(data):
+    with open(PLANNER_DATA_FILE, "w") as f: json.dump(data, f, indent=4)
+
+@app.route('/planner/data')
+def get_planner_data():
+    return jsonify(load_planner_data())
+
+CHATS_FILE = "chats.json"
+
+def load_all_chats():
+    if not os.path.exists(CHATS_FILE): return []
+    try:
+        with open(CHATS_FILE, "r") as f: return json.load(f)
+    except: return []
+
+def save_all_chats(chats):
+    with open(CHATS_FILE, "w") as f: json.dump(chats, f, indent=4)
+
+@app.route('/chats', methods=['GET'])
+def get_chats():
+    return jsonify(load_all_chats())
+
+@app.route('/chats/create', methods=['POST'])
+def create_chat():
+    data = request.get_json()
+    new_chat = {
+        "id": data.get("id", str(uuid.uuid4())),
+        "title": "New Chat",
+        "messages": [],
+        "created_at": time.time(),
+        "updated_at": time.time(),
+        "is_archived": False
+    }
+    chats = load_all_chats()
+    chats.append(new_chat)
+    save_all_chats(chats)
+    return jsonify(new_chat)
+
+@app.route('/chats/update', methods=['POST'])
+def update_chat():
+    data = request.get_json()
+    chat_id = data.get("id")
+    title = data.get("title")
+    messages = data.get("messages")
+    is_archived = data.get("is_archived")
+    
+    chats = load_all_chats()
+    for c in chats:
+        if c["id"] == chat_id:
+            if title is not None: c["title"] = title
+            if messages is not None: c["messages"] = messages
+            if is_archived is not None: c["is_archived"] = is_archived
+            c["updated_at"] = time.time()
+            break
+    save_all_chats(chats)
+    return jsonify({"status": "ok"})
+
+@app.route('/chats/delete', methods=['POST'])
+def delete_chat():
+    data = request.get_json()
+    chat_id = data.get("id")
+    chats = [c for c in load_all_chats() if c["id"] != chat_id]
+    save_all_chats(chats)
+    return jsonify({"status": "ok"})
+
+@app.route('/generate_title', methods=['POST'])
+def generate_title():
+    data = request.get_json()
+    first_msg = data.get("message", "")
+    prompt = f"Generate a short, semantic 3-5 word title for a conversation starting with: '{first_msg}'. Return ONLY the title string, no quotes."
+    try:
+        title = mistral_call(prompt, [], "Lyra Naming Engine")
+        return jsonify({"title": title.strip()})
+    except:
+        return jsonify({"title": "New Conversation"})
+
+@app.route('/planner/save', methods=['POST'])
+def save_planner():
+    save_planner_data(request.get_json())
+    return jsonify({"status": "saved"})
+
+
+@app.route('/planner/hotels')
+def discover_hotels():
+    city = request.args.get('city', 'Goa')
+    # Synthetic Discovery Engine (Mocking high-fidelity API response)
+    hotels = [
+        {"name": f"The {city} Grand", "price": "₹4,500/night", "rating": "4.8★", "img": "fa-hotel"},
+        {"name": f"Azure {city} Resort", "price": "₹7,200/night", "rating": "4.9★", "img": "fa-water"},
+        {"name": "Budget Oasis", "price": "₹1,200/night", "rating": "4.2★", "img": "fa-bed"}
+    ]
+    return jsonify(hotels)
+
+@app.route('/planner/events')
+def discover_events():
+    city = request.args.get('city', 'Goa')
+    events = [
+        {"title": f"{city} Music Fest", "time": "8 PM Tonight", "type": "Concert", "cost": "₹999"},
+        {"title": "Beach Yoga Summit", "time": "6 AM Tomorrow", "type": "Wellness", "cost": "Free"},
+        {"title": "Night Life Crawl", "time": "10 PM", "type": "Clubbing", "cost": "₹1,500"}
+    ]
+    return jsonify(events)
+
+@app.route('/planner/generate', methods=['POST'])
+def generate_planner():
+    data = request.get_json()
+    goal = data.get('goal', 'Plan my day')
+    user_context = memory.get("user_context", "Prefers nocturnal studying and has gym sessions.")
+    
+    prompt = f"""
+    Act as an elite productivity architect. 
+    User Goal: {goal}
+    Memory Context: {user_context}
+    
+    Break this into a structured daily schedule in JSON format.
+    Output MUST be a JSON list of objects: [ {{"time": "8 AM", "task": "Wake up", "category": "health"}}, ... ]
+    Only return raw JSON. No markdown.
+    """
+    
+    try:
+        raw_json = groq_call(prompt, [], "PLANNER_ORCHESTRATOR")
+        # Clean potential markdown
+        clean_json = raw_json.replace("```json", "").replace("```", "").strip()
+        schedule = json.loads(clean_json)
+        return jsonify({"schedule": schedule})
+    except Exception as e:
+        print(f"Planner Gen Error: {e}")
+        return jsonify({"error": "Failed to architect schedule", "raw": str(e)}), 500
+
+FINANCE_DATA_FILE = "finance.json"
+
+def load_finance_data():
+    if not os.path.exists(FINANCE_DATA_FILE): return {"watchlist": ["RELIANCE", "TCS", "AAPL", "NVDA"], "portfolio": {"invested": 100000, "units": {}}}
+    try:
+        with open(FINANCE_DATA_FILE, "r") as f: return json.load(f)
+    except: return {"watchlist": ["RELIANCE", "TCS", "AAPL", "NVDA"], "portfolio": {"invested": 100000, "units": {}}}
+
+def save_finance_data(data):
+    with open(FINANCE_DATA_FILE, "w") as f: json.dump(data, f, indent=4)
+
+@app.route('/finance/data')
+def get_finance_data():
+    return jsonify(load_finance_data())
+
+@app.route('/finance/save', methods=['POST'])
+def save_finance():
+    save_finance_data(request.get_json())
+    return jsonify({"status": "saved"})
+
+@app.route('/stock/<symbol>')
+def get_stock_data(symbol):
+    symbol = symbol.upper()
+    import random
+    # Highly sophisticated mock data generator
+    # We simulate a 7-day price history with realistic volatility
+    base_prices = {"RELIANCE": 2950, "TCS": 3800, "AAPL": 185, "NVDA": 850, "ZOMATO": 180, "GOOGL": 140}
+    base = base_prices.get(symbol, random.randint(100, 5000))
+    
+    history = []
+    curr = base
+    for _ in range(7):
+        curr = curr * (1 + random.uniform(-0.02, 0.025))
+        history.append(round(curr, 2))
+    
+    change = round(((history[-1] - history[-2]) / history[-2]) * 100, 2)
+    
+    return jsonify({
+        "symbol": symbol,
+        "price": history[-1],
+        "change": change,
+        "history": history,
+        "name": symbol + " INC."
+    })
+
+@app.route('/finance/ai', methods=['POST'])
+def finance_ai_analysis():
+    data = request.get_json()
+    symbol = data.get('stock')
+    price = data.get('price')
+    trend = data.get('trend')
+    
+    prompt = f"Analyze {symbol} at {price}. Trend: {trend}. Keep it simple, educational, and professional."
+    res = fast_orchestrator(prompt, [], "Lyra Market Analyst")
+    return jsonify({"analysis": res})
+
+# --------------------------
+# LYRA ECOSYSTEM SYNC LAYER
+# --------------------------
+
+@app.route('/system/state')
+def get_system_state():
+    return jsonify(GLOBAL_OS_STATE)
+
+@app.route('/system/sync', methods=['POST'])
+def update_system_state():
+    updates = request.get_json()
+    new_state = sync_system_state(updates)
+    return jsonify(new_state)
+
+# --------------------------
+# GEOSPATIAL INTELLIGENCE ENGINE
+# --------------------------
+MAJOR_CITIES = {
+    "GOA": (15.2993, 74.1240),
+    "MUMBAI": (19.0760, 72.8777),
+    "BANGALORE": (12.9716, 77.5946),
+    "CHENNAI": (13.0827, 80.2707),
+    "DELHI": (28.6139, 77.2090),
+    "PONDICHERRY": (11.9416, 79.8083),
+    "HYDERABAD": (17.3850, 78.4867)
+}
+
+def calculate_geo_distance(origin, target):
+    import math
+    o = origin.upper()
+    t = target.upper()
+    if o in MAJOR_CITIES and t in MAJOR_CITIES:
+        lat1, lon1 = MAJOR_CITIES[o]
+        lat2, lon2 = MAJOR_CITIES[t]
+        R = 6371 # km
+        dlat = math.radians(lat2 - lat1)
+        dlon = math.radians(lon2 - lon1)
+        a = math.sin(dlat/2)**2 + math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) * math.sin(dlon/2)**2
+        c = 2 * math.asin(math.sqrt(a))
+        return round(R * c)
+    return 0
+
+@app.route('/planner/trip', methods=['POST'])
+def plan_trip():
+    data = request.get_json()
+    goal = data.get('goal', 'Plan my trip')
+    
+    # Intelligence Extraction: Target City
+    target_city = "GOA"
+    for city in MAJOR_CITIES.keys():
+        if city.lower() in goal.lower():
+            target_city = city
+            break
+            
+    distance = calculate_geo_distance("CHENNAI", target_city)
+    budget = GLOBAL_OS_STATE["active_budget"]
+    
+    sys = f"""
+    Act as Lyra's Travel Architect. 
+    Constraint: Total budget is ₹{budget}.
+    Origin: CHENNAI | Target: {target_city} | Est. Distance: {distance}km.
+    Rules:
+    1. Provide ESTIMATED price ranges (e.g. ₹3,000 - ₹3,500).
+    2. Format as [ITINERARY] followed by a JSON list.
+    3. Include real-world distance steps.
+    Itinerary JSON Schema: [ {{"day": 1, "steps": [ {{"time": "10 AM", "activity": "...", "cost": 100, "distance": 10}} ] }} ]
+    """
+    
+    res = fast_orchestrator(goal, [], sys)
+    
+    if "[ITINERARY]" in res:
+        try:
+            itinerary_json = res.split("[ITINERARY]")[1].strip()
+            # DEFENSE: Strip markdown code blocks
+            itinerary_json = itinerary_json.replace("```json", "").replace("```", "").strip()
+            trip_data = json.loads(itinerary_json)
+            
+            # Unified Cost Engine
+            total_trip_cost = 0
+            total_distance = 0
+            for day in trip_data:
+                for step in day.get("steps", []):
+                    # Robust Cost Cleaning
+                    cost_val = str(step.get("cost", "0")).replace("₹", "").replace(",", "").split("-")[0].strip()
+                    try: total_trip_cost += int(float(cost_val))
+                    except: pass
+                    
+                    dist_val = str(step.get("distance", "0")).replace("km", "").strip()
+                    try: total_distance += int(float(dist_val))
+                    except: pass
+            
+            # System Synchronization
+            sync_system_state({
+                "planned_expenses": total_trip_cost,
+                "current_trip": {
+                    "destination": goal,
+                    "distance_km": total_distance,
+                    "total_estimated_cost": total_trip_cost,
+                    "itinerary": trip_data
+                }
+            })
+            
+            return jsonify({
+                "status": "success", 
+                "data": trip_data, 
+                "summary": {
+                    "cost": total_trip_cost,
+                    "distance": total_distance,
+                    "budget_safe": total_trip_cost <= budget
+                }
+            })
+        except Exception as e:
+            print(f"Sync Error: {e}")
+            pass
+            
+    return jsonify({"status": "fallback", "text": res})
+
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=5000, debug=True)

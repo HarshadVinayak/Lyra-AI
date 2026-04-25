@@ -1,0 +1,11 @@
+.env
+.DS_Store
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.json
+!vercel.json
+!package.json
+scratch/
+*.bak

@@ -1,0 +1,8 @@
+flask
+flask-cors
+requests
+python-dotenv
+duckduckgo_search
+PyPDF2
+Pillow
+markupsafe
