@@ -470,7 +470,7 @@ threading.Thread(target=preload_models, daemon=True).start()
 # LYRA AI BACKEND ARCHITECTURE
 # --------------------------
 
-@app.route('/update_memory', methods=['POST'])
+@app.route('/api/update_memory', methods=['POST'])
 def update_memory():
     data = request.get_json()
     memory["user_context"] = data.get("user_context", "")
@@ -874,13 +874,13 @@ def generate_image(prompt, quality="standard"):
 # FLASK ROUTING
 # --------------------------
 
-@app.route('/favicon.<ext>')
+@app.route('/api/favicon.<ext>')
 def serve_favicon(ext):
     for f in ['favicon.png', 'favicon.jpg']:
         if os.path.exists(os.path.join(app.root_path, f)): return send_file(os.path.join(app.root_path, f))
     return "Not Found", 404
 
- @app.route('/upload_image', methods=['POST'])
+ @app.route('/api/upload_image', methods=['POST'])
 def upload_image_standalone():
     if 'image' not in request.files: return jsonify({"error": "No image part"}), 400
     f = request.files['image']
@@ -920,7 +920,7 @@ def upload_image_standalone():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-@app.route('/vision_status/<job_id>')
+@app.route('/api/vision_status/<job_id>')
 def vision_status(job_id):
     job = VISION_JOBS.get(job_id)
     if not job: return jsonify({"error": "Job not found"}), 404
@@ -929,16 +929,16 @@ def vision_status(job_id):
 # --------------------------
 # EVOLUTION ROUTES
 # --------------------------
-@app.route('/evolution/proposals')
+@app.route('/api/evolution/proposals')
 def get_proposals():
     return jsonify({"proposals": memory.get("proposals", [])})
 
-@app.route('/evolution/analyze', methods=['POST'])
+@app.route('/api/evolution/analyze', methods=['POST'])
 def trigger_analysis():
     analyze_self()
     return jsonify({"status": "analyzing", "proposals": memory.get("proposals", [])})
 
-@app.route('/evolution/approve', methods=['POST'])
+@app.route('/api/evolution/approve', methods=['POST'])
 def approve_proposal():
     data = request.get_json()
     action = data.get('action')
@@ -1047,7 +1047,7 @@ def upload_file():
     threading.Thread(target=ingest_file_rag, args=(file_data, f.filename), daemon=True).start()
     return jsonify({"filename": f.filename, "status": "indexed", "info": f"{f.filename} is now part of my semantic knowledge base."})
 
-@app.route('/restore_session', methods=['POST'])
+@app.route('/api/restore_session', methods=['POST'])
 def restore_session():
     data = request.get_json()
     sid = data.get('session_id')
@@ -1057,7 +1057,7 @@ def restore_session():
         return jsonify({"status": "restablished"})
     return jsonify({"status": "failed"}), 400
 
-@app.route('/chat_stream', methods=['POST'])
+@app.route('/api/chat_stream', methods=['POST'])
 def chat_stream():
     data = request.get_json()
     raw_message = data.get('message', '')
@@ -1200,7 +1200,7 @@ def chat_stream():
                 time.sleep(0.01)
         return Response(stream_with_context(generate_err()), mimetype='text/plain')
 
-@app.route('/feedback', methods=['POST'])
+@app.route('/api/feedback', methods=['POST'])
 def save_feedback():
     data = request.get_json()
     msg_id = data.get('id')
@@ -1234,7 +1234,7 @@ def load_planner_data():
 def save_planner_data(data):
     with open(PLANNER_DATA_FILE, "w") as f: json.dump(data, f, indent=4)
 
-@app.route('/planner/data')
+@app.route('/api/planner/data')
 def get_planner_data():
     return jsonify(load_planner_data())
 
@@ -1249,11 +1249,11 @@ def load_all_chats():
 def save_all_chats(chats):
     with open(CHATS_FILE, "w") as f: json.dump(chats, f, indent=4)
 
-@app.route('/chats', methods=['GET'])
+@app.route('/api/chats', methods=['GET'])
 def get_chats():
     return jsonify(load_all_chats())
 
-@app.route('/chats/create', methods=['POST'])
+@app.route('/api/chats/create', methods=['POST'])
 def create_chat():
     data = request.get_json()
     new_chat = {
@@ -1269,7 +1269,7 @@ def create_chat():
     save_all_chats(chats)
     return jsonify(new_chat)
 
-@app.route('/chats/update', methods=['POST'])
+@app.route('/api/chats/update', methods=['POST'])
 def update_chat():
     data = request.get_json()
     chat_id = data.get("id")
@@ -1288,7 +1288,7 @@ def update_chat():
     save_all_chats(chats)
     return jsonify({"status": "ok"})
 
-@app.route('/chats/delete', methods=['POST'])
+@app.route('/api/chats/delete', methods=['POST'])
 def delete_chat():
     data = request.get_json()
     chat_id = data.get("id")
@@ -1296,7 +1296,7 @@ def delete_chat():
     save_all_chats(chats)
     return jsonify({"status": "ok"})
 
-@app.route('/generate_title', methods=['POST'])
+@app.route('/api/generate_title', methods=['POST'])
 def generate_title():
     data = request.get_json()
     first_msg = data.get("message", "")
@@ -1307,13 +1307,13 @@ def generate_title():
     except:
         return jsonify({"title": "New Conversation"})
 
-@app.route('/planner/save', methods=['POST'])
+@app.route('/api/planner/save', methods=['POST'])
 def save_planner():
     save_planner_data(request.get_json())
     return jsonify({"status": "saved"})
 
 
-@app.route('/planner/hotels')
+@app.route('/api/planner/hotels')
 def discover_hotels():
     city = request.args.get('city', 'Goa')
     # Synthetic Discovery Engine (Mocking high-fidelity API response)
@@ -1324,7 +1324,7 @@ def discover_hotels():
     ]
     return jsonify(hotels)
 
-@app.route('/planner/events')
+@app.route('/api/planner/events')
 def discover_events():
     city = request.args.get('city', 'Goa')
     events = [
@@ -1334,7 +1334,7 @@ def discover_events():
     ]
     return jsonify(events)
 
-@app.route('/planner/generate', methods=['POST'])
+@app.route('/api/planner/generate', methods=['POST'])
 def generate_planner():
     data = request.get_json()
     goal = data.get('goal', 'Plan my day')
@@ -1371,16 +1371,16 @@ def load_finance_data():
 def save_finance_data(data):
     with open(FINANCE_DATA_FILE, "w") as f: json.dump(data, f, indent=4)
 
-@app.route('/finance/data')
+@app.route('/api/finance/data')
 def get_finance_data():
     return jsonify(load_finance_data())
 
-@app.route('/finance/save', methods=['POST'])
+@app.route('/api/finance/save', methods=['POST'])
 def save_finance():
     save_finance_data(request.get_json())
     return jsonify({"status": "saved"})
 
-@app.route('/stock/<symbol>')
+@app.route('/api/stock/<symbol>')
 def get_stock_data(symbol):
     symbol = symbol.upper()
     import random
@@ -1405,7 +1405,7 @@ def get_stock_data(symbol):
         "name": symbol + " INC."
     })
 
-@app.route('/finance/ai', methods=['POST'])
+@app.route('/api/finance/ai', methods=['POST'])
 def finance_ai_analysis():
     data = request.get_json()
     symbol = data.get('stock')
@@ -1420,11 +1420,11 @@ def finance_ai_analysis():
 # LYRA ECOSYSTEM SYNC LAYER
 # --------------------------
 
-@app.route('/system/state')
+@app.route('/api/system/state')
 def get_system_state():
     return jsonify(GLOBAL_OS_STATE)
 
-@app.route('/system/sync', methods=['POST'])
+@app.route('/api/system/sync', methods=['POST'])
 def update_system_state():
     updates = request.get_json()
     new_state = sync_system_state(updates)
@@ -1458,7 +1458,7 @@ def calculate_geo_distance(origin, target):
         return round(R * c)
     return 0
 
-@app.route('/planner/trip', methods=['POST'])
+@app.route('/api/planner/trip', methods=['POST'])
 def plan_trip():
     data = request.get_json()
     goal = data.get('goal', 'Plan my trip')
