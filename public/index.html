@@ -16,8 +16,20 @@
     <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
     
     <style>
-        :root { --bg-main: #09090b; --bg-sidebar: #131316; --bg-input: rgba(41, 37, 54, 0.75); --text-main: #ffffff; --text-muted: #a1a1aa; --accent-purple: #8b5cf6; --accent-light: #c084fc; }
-        body { background-color: var(--bg-main); color: var(--text-main); font-family: 'Inter', sans-serif; margin: 0; padding: 0; display: flex; height: 100vh; overflow: hidden; background: radial-gradient(circle at 50% -20%, #1e133e, #09090b 70%); transition: background 0.4s ease, color 0.4s ease; }
+        :root { 
+            --bg-main: #09090b; 
+            --bg-sidebar: #0e0e11; 
+            --bg-card: rgba(24, 24, 27, 0.6);
+            --bg-input: rgba(28, 28, 35, 0.7); 
+            --text-main: #fafafa; 
+            --text-muted: #71717a; 
+            --accent-purple: #8b5cf6; 
+            --accent-light: #a78bfa; 
+            --accent-glow: rgba(139, 92, 246, 0.3);
+            --border-subtle: rgba(255, 255, 255, 0.08);
+            --font-main: 'Inter', system-ui, -apple-system, sans-serif;
+        }
+        body { background-color: var(--bg-main); color: var(--text-main); font-family: var(--font-main); margin: 0; padding: 0; display: flex; height: 100vh; overflow: hidden; background: radial-gradient(circle at 50% -20%, #17112a, #09090b 80%); transition: background 0.4s ease; }
         
         body.light-theme { --bg-main: #f8fafc; --bg-sidebar: #f1f5f9; --bg-input: rgba(255, 255, 255, 0.9); --text-main: #0f172a; --text-muted: #64748b; background: #f8fafc; }
         body.light-theme #top-bar { background: linear-gradient(180deg, rgba(248,250,252,0.95) 0%, rgba(248,250,252,0) 100%); }
@@ -181,7 +193,9 @@
 
         .message { max-width: 85%; padding: 18px 22px; border-radius: 20px; font-size: 1.05rem; line-height: 1.6; position: relative; font-family: 'Inter', sans-serif; transition: all 0.3s ease; }
         .user-message { background: rgba(255,255,255,0.05); color: #fff; align-self: flex-end; border-bottom-right-radius: 4px; border: 1px solid rgba(255,255,255,0.08); }
-        .bot-message { background: transparent; color: #e2e8f0; align-self: flex-start; border-bottom-left-radius: 4px; padding-left: 0; }
+        .bot-message { background: transparent; color: #e2e8f0; align-self: flex-start; border-bottom-left-radius: 4px; padding-left: 0; margin-bottom: 30px; border-left: 2px solid var(--border-subtle); padding-left: 20px; }
+        .bot-message p { margin-bottom: 1.2em; }
+        .bot-message h1, .bot-message h2, .bot-message h3 { margin-top: 1.5em; margin-bottom: 0.8em; color: #fff; }
         
         .thinking-state { display: flex; align-items: center; gap: 8px; color: #8b5cf6; font-weight: 600; font-size: 0.9rem; margin-bottom: 12px; animation: pulse-opacity 2s infinite ease-in-out; }
         @keyframes pulse-opacity { 0%, 100% { opacity: 0.6; } 50% { opacity: 1; } }
@@ -375,10 +389,24 @@
     .rail-icon:hover { background: rgba(255,255,255,0.05); color: #fff; }
     .rail-icon.active { background: var(--accent-purple); color: #fff; box-shadow: 0 0 15px rgba(139,92,246,0.5); }
     
-    #app-viewer { flex: 1; position: relative; overflow: hidden; display: flex; }
-    .os-status-bar { position: absolute; top: 0; left: 0; width: 100%; height: 35px; background: rgba(139,92,246,0.05); border-bottom: 1px solid rgba(139,92,246,0.1); display: flex; align-items: center; padding: 0 45px; gap: 30px; z-index: 1000; backdrop-filter: blur(10px); }
-    .status-node { font-family: 'Courier Prime', monospace; font-size: 0.65rem; color: #a1a1aa; display: flex; align-items: center; gap: 8px; font-weight: 700; letter-spacing: 0.5px; }
-    .status-node i { color: var(--accent-purple); font-size: 0.8rem; }
+    #app-viewer { flex: 1; position: relative; overflow: hidden; display: flex; box-shadow: inset 0 0 100px rgba(0,0,0,0.5); }
+    .os-status-bar { 
+        position: absolute; top: 0; left: 0; width: 100%; height: 40px; 
+        background: rgba(9, 9, 11, 0.8); backdrop-filter: blur(12px);
+        border-bottom: 1px solid var(--border-subtle); 
+        display: flex; align-items: center; padding: 0 45px; gap: 15px; z-index: 1000; 
+    }
+    .status-tag {
+        font-family: 'Courier Prime', monospace; font-size: 0.65rem; 
+        padding: 4px 10px; border-radius: 6px; background: rgba(255,255,255,0.03);
+        border: 1px solid var(--border-subtle); color: var(--text-muted);
+        display: flex; align-items: center; gap: 6px; font-weight: 700; letter-spacing: 0.5px;
+    }
+    .status-tag.active { border-color: rgba(74, 222, 128, 0.3); color: #4ade80; }
+    .status-tag.active i { color: #4ade80; }
+    .status-tag.premium { border-color: rgba(139, 92, 246, 0.3); color: var(--accent-light); }
+    .status-tag.premium i { color: var(--accent-purple); }
+    
     .status-node #os-node-status { color: #4ade80; }
     .status-node #os-budget-val { color: #fff; }
     .status-node #os-trip-val { color: #fff; }
@@ -623,11 +651,11 @@
 
 <div id="app-viewer">
     <div id="os-status-bar" class="os-status-bar">
-        <div class="status-node"><i class="fa-solid fa-microchip"></i> LYRA CORE: <span id="os-node-status">ACTIVE</span></div>
-        <div class="status-node"><i class="fa-solid fa-wallet"></i> BUDGET: <span id="os-budget-val">₹0</span></div>
-        <div class="status-node"><i class="fa-solid fa-route"></i> TRIP: <span id="os-trip-val">NONE</span></div>
+        <div class="status-tag active"><i class="fa-solid fa-microchip"></i> LYRA CORE: <span id="os-node-status">ACTIVE</span></div>
+        <div class="status-tag premium"><i class="fa-solid fa-wallet"></i> BUDGET: <span id="os-budget-val">₹0</span></div>
+        <div class="status-tag"><i class="fa-solid fa-route"></i> TRIP: <span id="os-trip-val">NONE</span></div>
         <div style="flex:1"></div>
-        <div class="status-node sync-pulse"><i class="fa-solid fa-rotate"></i> SYSTEM SYNC: <span id="os-last-sync">NOW</span></div>
+        <div class="status-tag sync-pulse"><i class="fa-solid fa-rotate"></i> SYSTEM SYNC: <span id="os-last-sync">NOW</span></div>
     </div>
     <!-- CHAT APP -->
     <div id="app-chat" class="app-page active" style="flex-direction:row;">
@@ -655,13 +683,10 @@
         <div id="main-content">
             <div id="top-bar">
                 <div class="model-selector-wrapper">
-                    <select id="provider-select">
-                        <option value="smart" selected>Smart Mode</option>
+                    <select id="provider-select" onchange="updateUIForProvider(this.value)">
+                        <option value="smart" selected>LYT G1 Model</option>
+                        <option value="agent">Agentic Autopilot</option>
                         <option value="orchestrator">Orchestrator AI</option>
-                        <option value="agent">Agent Mode</option>
-                        <option value="groq">Groq</option>
-                        <option value="openrouter">OpenRouter</option>
-                        <option value="gemini">Gemini</option>
                     </select>
                     <i class="fa-solid fa-chevron-down"></i>
                 </div>
@@ -1613,14 +1638,18 @@
         else { document.body.classList.remove('light-theme'); localStorage.setItem('lyraTheme', 'dark'); }
     }
 
-    function changeMode(modeVal) {
-        currentStyle = modeVal;
+    function changeMode(m) {
+        currentStyle = m;
         document.querySelectorAll('.style-btn').forEach(b => {
-            b.classList.remove('active');
-            if(b.dataset.style === modeVal) b.classList.add('active');
+             b.classList.remove('active');
+             if (b.innerText.toLowerCase().includes(m)) b.classList.add('active');
         });
-        showToast("Context Override: " + modeVal.charAt(0).toUpperCase() + modeVal.slice(1));
-        localStorage.setItem('lyraMode', modeVal);
+        
+        let msg = "Neural Speed Layer active.";
+        if (m === "smart") msg = "LYT G1 Intelligence active.";
+        if (m === "creative") msg = "Visionary Creative Engine active.";
+        showToast(msg);
+        localStorage.setItem('lyraMode', m);
     }
 
     function updateAvatar(val) { if(val.trim()){ document.getElementById('avatar-chip').innerText = val.toUpperCase().substring(0,2); localStorage.setItem('lyraAvatar', val); } }
@@ -1632,6 +1661,12 @@
         showToast("Memory profile synchronized.");
     }
     document.getElementById('memory-input').onblur = saveMemoryProfile;
+
+    function updateUIForProvider(p) {
+        if (p === 'agent') showToast("Agentic Autopilot: Sequencing and multi-step reasoning active.");
+        else if (p === 'orchestrator') showToast("Orchestrator AI: System-wide control and sync active.");
+        else showToast("LYT G1 Model: Deep reasoning core active.");
+    }
 
     window.addEventListener('DOMContentLoaded', () => {
         const savedTheme = localStorage.getItem('lyraTheme');
@@ -2039,7 +2074,10 @@
         // MULTIMODAL IMAGE DETECTION & UI LOADER
         const isImageGen = text.toLowerCase().includes("generate image") || text.toLowerCase().includes("draw ") || text.toLowerCase().includes("image of") || text.toLowerCase().includes("make a picture") || text.toLowerCase().includes("create image") || text.toLowerCase().includes("create a picture");
         
-        let modeLabel = provider === "smart" ? "SMART 4.0" : provider === "agent" ? "AUTO GEN" : provider.toUpperCase();
+        let modeLabel = "LYT G1";
+        if (provider === "agent") modeLabel = "AGENTIC AUTOPILOT";
+        else if (provider === "orchestrator") modeLabel = "ORCHESTRATOR AI";
+        
         let osIndicators = "";
         
         if (text.includes("[UTIL: PLANNER]")) osIndicators += `<span><i class="fa-solid fa-calendar-check"></i> Planner Hive</span>`;

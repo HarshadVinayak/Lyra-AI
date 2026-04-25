@@ -527,8 +527,8 @@ def detect_os_intent(query):
     if any(k in q for k in ["search", "find", "who is", "latest", "news", "google", "current"]): return "SEARCH"
     return "CHITCHAT"
 
-def fast_orchestrator(message, history, mode_prompt):
-    """Refined multi-model routing & fallback system."""
+def fast_orchestrator(message, history, mode_prompt, branded_mode="LYT G1"):
+    """Refined multi-model routing & fallback system for LYT G1."""
     # Step 1: Detect intent and perform potential Search
     intent = detect_os_intent(message)
     
@@ -553,38 +553,44 @@ def fast_orchestrator(message, history, mode_prompt):
 
     style = memory["config"].get("response_style", "smart")
     
+    # Internal Mapping
+    # LYT G1 = Smart mode (Parallel synthesis)
+    # Orchestrator AI = System logic prioritized
+    
+    if branded_mode == "Orchestrator AI":
+        mode_prompt += "\n[SYSTEM ROLE]: Executive Controller. Prioritize tool outputs and system state updates."
+
     # Model Map
     logical_models = [groq_call, cerebras_call, sambanova_call]
     creative_models = [mistral_call, together_call, gemini_call]
-    fast_models = [cerebras_call, huggingface_call]
 
     # Step 3: Execution Strategy
     try:
         if style == "fast":
-            # Priority: Speed
+            # FAST MODE: Precision & Speed (Cerebras / Groq)
             return cerebras_call(message, history, mode_prompt)
         elif style == "creative":
-            # Priority: Personality & Idea Generation
+            # CREATIVE MODE: Visionary & Fluid (Mistral)
             return mistral_call(message, history, mode_prompt)
         else:
-            # SMART MODE: Parallel Synthesis
+            # SMART MODE (LYT G1): Parallel Synthesis
+            # Uses best-of-n logic with Groq/SambaNova
             with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
-                # Query logic models in parallel for best answer
                 futures = {executor.submit(m, message, history, mode_prompt): m.__name__ for m in logical_models[:2]}
-                for future in concurrent.futures.as_completed(futures, timeout=8.0):
+                for future in concurrent.futures.as_completed(futures, timeout=10.0):
                     result = future.result()
-                    if result and len(result) > 5: return result
+                    if result and len(result) > 10: return result
     except Exception as e:
         print(f"Orchestration Error: {e}. Executing Fallback Layer...")
     
     # Universal Fallback Layer
-    for model_fn in [gemini_call, together_call, sambanova_call]:
+    for model_fn in [gemini_call, together_call, openrouter_call]:
         try:
             res = model_fn(message, history, mode_prompt)
             if res: return res
         except: continue
         
-    return "The Lyra intelligence node is currently experiencing heavy architectural load. Please re-synchronize your query."
+    return "The Lyra intelligence node is currently experiencing architectural load. Please wait while we stabilize your stream."
 
 def construct_payload(message, history, mode_prompt):
     base_sys = f"{SYSTEM_PROMPT}\n\n[USER SYSTEM INSTRUCTION]: {mode_prompt}"
@@ -1144,32 +1150,18 @@ def chat_stream():
 
         if "[UTIL:" in raw_message:
             final_text = run_utility_orchestrator(raw_message)
-            provider_name = "Lyra Utility Engine 🛰️"
-        elif len(raw_message.split()) < 4 and provider not in ["orchestrator", "smart"]: final_text = mistral_call(raw_message, history, mode_prompt)
         elif provider == "smart":
-            # Smart Reasoning + Multimodal Context
-            final_text = fast_orchestrator(raw_message, history, mode_prompt)
-            provider_name = "Lyra Smart Core 🧠"
+            # LYT G1 Core
+            final_text = fast_orchestrator(raw_message, history, mode_prompt, branded_mode="LYT G1")
+        elif provider == "agent":
+            # Agentic Autopilot
+            final_text = run_agent_swarm(raw_message)
         elif provider == "orchestrator":
-            # Pure Speed Mode
-            final_text = fast_orchestrator(raw_message, history, mode_prompt)
-            provider_name = "Lyra Speed Fabric ⚡"
+            # Orchestrator AI Control
+            final_text = fast_orchestrator(raw_message, history, mode_prompt, branded_mode="Orchestrator AI")
         else:
-            # Direct Provider Call with Fallback
-            provider_funcs = {
-                "groq": groq_call, 
-                "mistral": mistral_call,
-                "gemini": gemini_call, 
-                "sambanova": sambanova_call,
-                "together": together_call,
-                "cerebras": cerebras_call
-            }
-            func = provider_funcs.get(provider, fast_orchestrator)
-            try:
-                final_text = func(raw_message, history, mode_prompt)
-            except:
-                final_text = fast_orchestrator(raw_message, history, mode_prompt)
-            provider_name = f"Node: {provider.capitalize()}"
+            # Silent Fallback
+            final_text = fast_orchestrator(raw_message, history, mode_prompt)
 
         # CACHE FINAL RESULT
         query_cache[cache_key] = final_text
